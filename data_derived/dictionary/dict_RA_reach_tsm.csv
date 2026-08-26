@@ -1,0 +1,14 @@
+column,unit,description
+event_id,-,Source event: RA_20230906_N or RA_20230906_P
+slug_label,-,N or P — which slug this row belongs to; the two are NOT on a shared time axis
+solute,-,NH4-N or SRP
+curve_limb,-,"rising / peak / falling, from the paired conservative tracer"
+time_since_release_s,s,"Elapsed time since THIS slug's own release (N: 16:45; P: 14:30, 2023-09-06)"
+spc_uscm_grab,uS/cm,Handheld-probe SpC at the grab
+nacl_mgL,mg/L,"Paired conservative tracer (logger-interpolated where available, else grab)"
+conc_corr_ugL,ug/L,Background-corrected nutrient concentration
+conc_corr_coprec_ugL,ug/L,"SRP only: + House (1990) co-precipitation correction (negligible here, see 03 Sec 1.1)"
+discharge_Ls_reach_mean,L/s,"228 = mean(205 [N], 251 [P]); single adopted Q for this consolidated reach dataset"
+discharge_Ls_reach_sd,L/s,"33 = sd(205, 251); carried as the reach discharge uncertainty"
+reach_length_m,m,"135, from event geometry (Section 6)"
+reach_mean_width_m,m,"9.46, from event geometry (Section 6)"

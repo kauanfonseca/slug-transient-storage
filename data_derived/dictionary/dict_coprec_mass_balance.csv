@@ -1,0 +1,17 @@
+column,unit,description
+event_id,-,Event key
+n,-,Number of SRP grabs with a defined p_coprec_ugL
+t_span_s,s,Time span covered by those grabs; integration domain
+discharge_Ls,L/s,"Adopted event discharge (events$discharge_Ls), treated as steady over the event"
+mass_srp_exported_ug,ug,"discharge_Ls * trapz(time_since_release_s, pmax(conc_corr_ugL, 0)); background-corrected SRP mass transported past the station over the sampled window"
+mass_p_coprec_ug,ug,"discharge_Ls * trapz(time_since_release_s, p_coprec_ugL); P mass removed by coprecipitation over the sampled window. Not clamped at zero -- see prose"
+frac_mass_coprec,-,"mass_p_coprec_ug / mass_srp_exported_ug; mass-weighted, event-integrated analogue of the per-grab median frac_of_srp in Sec. 9.5"
+added_mass_PO4_g,g,"Mass of the phosphate salt added, nutrient_addition_phosphate_data.csv"
+molar_mass_P_nutrient,g/mol,Molar mass of the salt added (type_P)
+mass_P_added_g,g,added_mass_PO4_g * (M_P / molar_mass_P_nutrient); elemental P mass injected
+pct_of_injectate_coprec,%,"100 * (mass_p_coprec_ug/1e6) / mass_P_added_g; independent check, does not use conc_corr_ugL"
+flag_delta_ca_neg,-,Carried from Sec. 9.5: TRUE when the reach gained calcium (model not parameterised for that direction)
+flag_discharge_invalid,-,Carried from Sec. 6: TRUE when no valid discharge estimate exists for this event
+flag_insufficient_samples,-,TRUE when n < 3 (cannot integrate); mass columns are NA
+flag_coprec_exceeds_injectate,-,"TRUE when pct_of_injectate_coprec > 100 -- physically impossible, flags a remaining error rather than a real effect"
+flag_conc_corr_na_in_window,-,"TRUE when any conc_corr_ugL in the window is NA; frac_mass_coprec is then NA but pct_of_injectate_coprec (independent of conc_corr_ugL) is not -- expected, not a bug"

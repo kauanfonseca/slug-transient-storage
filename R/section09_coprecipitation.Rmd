@@ -1,0 +1,591 @@
+# 9. CaCO₃ co-precipitation correction for SRP
+
+## 9.1 Why the correction is needed
+
+In alkaline karst streams part of the dissolved inorganic phosphorus is
+removed abiotically, adsorbed onto calcite as it precipitates, rather
+than assimilated by organisms. In the breakthrough curve that removal is
+indistinguishable from biological uptake: both make phosphorus disappear
+faster than the conservative tracer. Left uncorrected it inflates every
+phosphorus uptake metric, and the inflation is largest exactly where
+calcite precipitation is strongest — a systematic bias correlated with
+the variable of interest, not noise.
+
+## 9.2 What the correction does
+
+Following House (1986, 1990), the co-precipitated P at each grab is
+
+$$ n_{P,\mathrm{cop}} = \Delta n_{\mathrm{Ca}}\,(\sigma\,N_A\,d)\,h $$
+
+where $\Delta n_{\mathrm{Ca}}$ is the net loss of dissolved Ca²⁺ across
+the reach, $\sigma$ the maximum surface density of P on precipitating
+calcite, $d$ the molecular surface area of calcite, $N_A$ Avogadro's
+number, and $h$ the fraction of dissolved phosphate liable to sorb, from
+the two-component Langmuir model
+
+$$ h = \frac{K_1 a_{\mathrm{PO}_4^{3-}} + K_2 a_{\mathrm{HPO}_4^{2-}}}
+             {1 + K_1 a_{\mathrm{PO}_4^{3-}} + K_2 a_{\mathrm{HPO}_4^{2-}}} $$
+
+with activities from PHREEQC and $K_1$, $K_2$ temperature-dependent
+through Arrhenius expressions.
+
+**Where each term comes from.** The activities are computed from the
+**downstream** solution — the water passing the sampling station is what
+must be speciated — using downstream pH, temperature and major ions,
+with `ca_mgL_down` rather than any upstream-downstream mean.
+$\Delta n_{\mathrm{Ca}}$ comes from a synoptic pair: upstream and
+downstream calcium sampled on arrival at the reach, before the nutrient
+release. It measures the calcite precipitation the reach was sustaining
+under ambient conditions, so it is one value per event, and the
+within-event variation in $n_{P,\mathrm{cop}}$ comes entirely from $h$,
+which tracks phosphate speciation as the slug passes. This follows from
+the design: a single ambient pair characterises the reach, and the model
+scales it by how much phosphate is present at each instant.
+
+Two consequences are stated rather than worked around. The calcium pair
+predates the release, so it cannot capture any change in calcite dynamics
+caused by the addition itself. And being a single pair, the correction
+carries no within-event uncertainty — its uncertainty is entirely between
+events.
+
+**Data provenance note.** The `ph` and `temp_c` columns of the nutrient
+spreadsheets originally carried the upstream reading for some events, a
+field-sheet transcription error corrected before the speciation was run.
+Since 0.1 pH unit and 1 °C both shift $K_1$, $K_2$ and the
+PO₄³⁻/HPO₄²⁻ partition measurably, the guard in
+`R/phreeqc_speciation.R` re-checks every event against the synoptic
+upstream table and warns if any still matches the upstream value exactly.
+
+## 9.3 How it enters the pipeline, and why not as an overwrite
+
+Under TASCC the correction feeds a per-sample regression of
+$S_{w\text{-add}}$ against the geometric mean concentration, so each grab
+yields its own uptake length and a corrected point simply replaces an
+uncorrected one. Under inverse transient-storage modelling the corrected
+series **is** the observation vector: the whole curve is fitted at once,
+and a correction applied unevenly along it changes the shape the model is
+matching, not just the value at a point. Overwriting would make the two
+analyses non-comparable and irreversible.
+
+The correction is therefore added as parallel columns and
+`conc_corr_ugL` is never modified, so both series can be run through the
+inverse model and the difference attributed to the abiotic pathway.
+
+**Naming.** The suffix `_corr` already means "background-corrected"
+throughout this pipeline (`conc_corr_ugL`, `spc_corr_uscm`,
+`spc_corr_uscm_grab`). The co-precipitation column extends that same
+series rather than introducing a second meaning, so it is
+`conc_corr_coprec_ugL`: the background-corrected concentration, plus the
+co-precipitated fraction. It is `NA` for NH4-N, like every other
+SRP-specific column in this long-format table.
+
+## 9.4 Geochemical check
+
+Evidence that calcite was actively precipitating should not come from the
+same model that assumes it. Calcite saturation indices are not used: the
+speciation input carries no carbonate species, and the only alkalinity
+available is a campaign mean rather than an event-specific measurement,
+so a computed index would rest on a value that was not measured on the
+day.
+
+Two independent lines are used instead, and they answer different
+questions.
+
+**Calcium is spatial.** Both samples were taken on arrival at the reach,
+one at each station, so `ca_response` is a genuine synoptic comparison
+and measures net loss of dissolved calcium along the reach — the quantity
+the House model requires. This is the line that establishes whether the
+mechanism operated.
+
+**pH, dissolved oxygen and specific conductance are temporal.** The
+upstream reading is from arrival and the downstream reading from the end
+of sampling, so these compare the start and end of the experiment rather
+than two stations. Rising pH together with rising DO is the signature of
+autotrophic activity, which draws down CO₂ and drives the supersaturation
+that makes calcite precipitate. Falling specific conductance is
+consistent with removal of Ca²⁺ and HCO₃⁻, and is the same diel drift the
+drifting baseline of Section 3 corrects for.
+
+The distinction matters: a temporal change at one station does not by
+itself demonstrate loss along the reach. Calcium demonstrates that; the
+temporal indicators say whether the system was behaving as an active
+autotrophic-calcite system while it happened. The correction is applied
+where calcium shows net loss and the temporal indicators are consistent
+with that mechanism.
+
+```{r coprec-geochem-check}
+synoptic_up <- read_csv(here("data", "nutrients", "synoptic_upstream.csv"),
+                        show_col_types = FALSE) %>%
+  mutate(date = ymd(as.character(date)))
+
+geochem_check <- p_raw %>%
+  group_by(stream, date) %>%
+  summarise(across(any_of(c("ph", "temp_c", "do_mgL", "ca_mgL_up",
+                            "ca_mgL_down", "SpC_uScm_bck")),
+                   ~ first(na.omit(.x))), .groups = "drop") %>%
+  rename(ph_down = ph, temp_c_down = temp_c, spc_uscm_down = SpC_uScm_bck) %>%
+  {  # DO downstream is optional: drop the term if the column is absent
+    if ("do_mgL" %in% names(.)) rename(., do_mgL_down = do_mgL) else .
+  } %>%
+  left_join(synoptic_up, by = c("stream", "date")) %>%
+  mutate(
+    # ---- SPATIAL (synoptic): both Ca samples taken on arrival ----
+    ca_response = ca_mgL_down / ca_mgL_up,
+    ca_loss_pct = 100 * (1 - ca_response),
+
+    # ---- TEMPORAL: upstream on arrival vs downstream at end of sampling ----
+    delta_ph_expt  = ph_down - ph_up,
+    delta_spc_expt = spc_uscm_down - spc_uscm_up,
+    spc_change_pct = 100 * (spc_uscm_down / spc_uscm_up - 1),
+    delta_do_expt  = if ("do_mgL_down" %in% names(cur_data_all()))
+                       do_mgL_down - do_mgL_up else NA_real_,
+
+    # autotrophic signature: pH rising, and DO rising where it was measured
+    autotrophic_signal = delta_ph_expt > 0 &
+                         (is.na(delta_do_expt) | delta_do_expt > 0),
+
+    # the synoptic sheet and the nutrient sheet must agree on upstream Ca
+    ca_up_agrees = abs(ca_mgL_up - ca_mgL_up_synoptic) < 0.5
+  )
+
+geochem_check %>%
+  select(stream, date, ca_mgL_up, ca_mgL_down, ca_loss_pct,
+         delta_ph_expt, delta_do_expt, spc_change_pct,
+         autotrophic_signal, ca_up_agrees) %>%
+  arrange(desc(ca_loss_pct)) %>%
+  print(n = Inf)
+```
+
+> **QAQC note.** `ca_loss_pct` above zero means the reach lost dissolved
+> calcium between the stations, which is what precipitation produces;
+> below zero means it gained calcium, which precipitation cannot explain
+> and dissolution can. Because calcium rests on a single sample at each
+> station, a loss of a few percent sits within the analytical error of
+> the determination and should not be read as signal.
+>
+> `autotrophic_signal` is context, not proof: it says the reach was
+> photosynthesising between the two readings, which is the process that
+> drives calcite supersaturation. It cannot substitute for the calcium
+> response, because it compares two moments rather than two stations.
+> `ca_up_agrees` guards against the synoptic sheet and the nutrient sheet
+> disagreeing on the same upstream number.
+>
+> The synoptic pair exists only for the seven events that received
+> nutrients. CB 2023-09-07, RA 2023-09-06 and SA 2023-10-10 have no
+> upstream calcium and therefore receive no co-precipitation correction;
+> they are not part of the phosphorus comparison.
+
+## 9.5 Application
+
+```{r coprec-constants}
+# House (1986, 1990). sigma is the maximum surface density of P associated
+# with calcite precipitation in alkaline streams; d the molecular surface area
+# of calcite; A1/A2 and E1/E2 the Arrhenius coefficients of the two-component
+# Langmuir constants.
+#
+# SIGMA_P: House (1990) reports several sigma estimates, and they cluster
+# by solution type, not scatter randomly -- field/river waters run
+# 0.055-0.095 umol/m2 (River Frome, River Windrush, Waterston chalk
+# aquifer), while idealised synthetic Ca(HCO3)2 solutions run higher,
+# 0.13-0.22 umol/m2. This is a karst STREAM, not a synthetic solution, so
+# the field cluster is the physically appropriate class. 5.5e-8 mol/m2 is
+# the River Frome value (House et al. 1986a; the "river water" case House
+# 1990 itself highlights), and is the same value and the same reasoning
+# Cohen et al. (2013, Ecological Monographs 83:2) adopted for the
+# Ichetucknee River -- a spring-fed karst/calcite stream directly
+# analogous to this system -- explicitly preferring the field value over
+# laboratory values because natural water carries competing solutes
+# (Mg, Fe, DOM) that reduce the effective sorption area, and because their
+# own sensitivity check found the lab-range value inflates the correction
+# ~47x and produces implausible C:P ratios. See Section 9.8 for the
+# corresponding sensitivity range in this pipeline.
+SIGMA_P   <- 5.5e-8        # mol/m2 -- River Frome (House 1990 / Cohen et al. 2013)
+D_CALCITE <- 2.01e-19      # m2/molecule
+N_AVOG    <- 6.02214076e23 # molecules/mol
+R_GAS     <- 8.314         # J/mol/K
+A1 <- 0.6915  ; E1 <- 18.2e3   # J/mol
+A2 <- 4.361e-9; E2 <- 42.6e3   # J/mol
+
+M_P  <- 30.973762   # g/mol
+M_CA <- 40.078      # g/mol
+
+h_langmuir2 <- function(a_PO4, a_HPO4, K1, K2) {
+  num <- K1 * a_PO4 + K2 * a_HPO4
+  num / (1 + num)
+}
+```
+
+```{r coprec-apply}
+act_path <- here("data_derived", "phreeqc_activities.csv")
+
+if (!file.exists(act_path)) {
+  warning("phreeqc_activities.csv nao encontrado: rode R/phreeqc_speciation.R. ",
+          "As colunas de coprecipitacao ficarao NA.")
+  coprec <- tibble(stream = character(), date = as.Date(character()),
+                   sample_btc = numeric())
+} else {
+  coprec <- read_csv(act_path, show_col_types = FALSE) %>%
+    mutate(date = as.Date(date)) %>%
+    left_join(
+      p_raw %>% select(stream, date, sample_btc, temp_c, ca_mgL_up, ca_mgL_down),
+      by = c("stream", "date", "sample_btc")
+    ) %>%
+    mutate(
+      T_K = temp_c + 273.15,
+      k1_langmuir = A1 * exp(E1 / (R_GAS * T_K)),
+      k2_langmuir = A2 * exp(E2 / (R_GAS * T_K)),
+      # House's K1/K2 (Eq. 7-8) and the Langmuir isotherm (Eq. 9, House
+      # 1990) are defined for [PO4^3-]/[HPO4^2-] in umol/dm^3 -- House
+      # states this explicitly under Eq. 8. PHREEQC's -activities output
+      # is on a mol/L numeric scale, six orders of magnitude smaller;
+      # unconverted, it collapses h_adsorbed toward ~0 regardless of
+      # saturation. See vignettes/02_integration.Rmd's coprec-apply
+      # chunk for the same fix and full rationale.
+      h_adsorbed  = h_langmuir2(a_PO4 * 1e6, a_HPO4 * 1e6, k1_langmuir, k2_langmuir),
+
+      # synoptic pre-release pair; positive = calcium lost across the reach
+      delta_ca_mgL  = ca_mgL_up - ca_mgL_down,
+      delta_ca_molL = delta_ca_mgL / (1000 * M_CA),
+
+      p_coprec_molL = delta_ca_molL * (SIGMA_P * N_AVOG * D_CALCITE) * h_adsorbed,
+      p_coprec_ugL  = p_coprec_molL * M_P * 1e6,
+
+      flag_delta_ca_neg = delta_ca_mgL < 0
+    ) %>%
+    select(stream, date, sample_btc, a_PO4, a_HPO4, h_adsorbed,
+           k1_langmuir, k2_langmuir, delta_ca_mgL, p_coprec_ugL,
+           flag_delta_ca_neg)
+}
+
+# Adding p_coprec to the background-corrected concentration reconstructs the
+# SRP that would have been present without abiotic removal:
+#   (measured + coprecipitated) - background
+# Background subtraction and this addition commute, so order is immaterial.
+btc_nutrients <- btc_nutrients %>%
+  select(-any_of(c("a_PO4", "a_HPO4", "h_adsorbed", "k1_langmuir",
+                   "k2_langmuir", "delta_ca_mgL", "p_coprec_ugL",
+                   "flag_delta_ca_neg", "conc_corr_coprec_ugL"))) %>%
+  left_join(coprec, by = c("stream", "date", "sample_btc")) %>%
+  mutate(
+    across(c(a_PO4, a_HPO4, h_adsorbed, k1_langmuir, k2_langmuir,
+             delta_ca_mgL, p_coprec_ugL),
+           ~ if_else(solute == "SRP", .x, NA_real_)),
+    flag_delta_ca_neg = if_else(solute == "SRP", flag_delta_ca_neg, NA),
+    conc_corr_coprec_ugL = if_else(solute == "SRP",
+                                   conc_corr_ugL + p_coprec_ugL,
+                                   NA_real_)
+  )
+
+btc_nutrients %>%
+  filter(solute == "SRP") %>%
+  group_by(event_id) %>%
+  summarise(
+    n = n(),
+    delta_ca_mgL = first(delta_ca_mgL),
+    h_median     = median(h_adsorbed, na.rm = TRUE),
+    coprec_median_ugL = median(p_coprec_ugL, na.rm = TRUE),
+    frac_of_srp  = median(p_coprec_ugL / conc_corr_ugL, na.rm = TRUE),
+    delta_ca_neg = first(flag_delta_ca_neg),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(delta_ca_mgL)) %>%
+  print(n = Inf)
+```
+
+> **QAQC note.** `frac_of_srp` is the size of the correction relative to
+> the signal being corrected, and it decides how much any of this
+> matters. Where it is small, the treatment of ΔCa < 0 cannot change a
+> conclusion; where it approaches unity, the corrected series is largely
+> model output rather than measurement, and the inverse fit should be
+> reported for both series.
+>
+> Where `delta_ca_neg` is TRUE the reach gained calcium: calcite
+> dissolved rather than precipitated. The House model returns a negative
+> $n_{P,\mathrm{cop}}$ there, so the correction subtracts phosphorus,
+> which is outside the direction the model was parameterised for. No
+> precedent for this case exists in the BTC literature, so these events
+> are flagged and carried forward, and robustness of the main conclusions
+> is demonstrated across alternative treatments of them rather than one
+> treatment being asserted as correct.
+
+```{r coprec-export}
+write_csv(btc_nutrients, here("data_derived", "btc_nutrients.csv"))
+saveRDS(btc_nutrients,   here("data_derived", "btc_nutrients.rds"))
+
+write_csv(geochem_check, here("data_derived", "geochem_check.csv"))
+
+dict_coprec <- tribble(
+  ~column, ~unit, ~description,
+  "a_PO4",               "-",     "PO4(3-) activity, PHREEQC, downstream solution",
+  "a_HPO4",              "-",     "HPO4(2-) activity, PHREEQC, downstream solution",
+  "k1_langmuir",         "-",     "Two-component Langmuir constant for PO4(3-), Arrhenius in temp_c",
+  "k2_langmuir",         "-",     "Two-component Langmuir constant for HPO4(2-), Arrhenius in temp_c",
+  "h_adsorbed",          "-",     "Fraction of dissolved phosphate liable to sorb onto new calcite",
+  "delta_ca_mgL",        "mg/L",  "ca_mgL_up - ca_mgL_down, synoptic pair on arrival; positive = Ca lost",
+  "p_coprec_ugL",        "ug/L",  "Inorganic P co-precipitated with calcite, House (1990)",
+  "conc_corr_coprec_ugL","ug/L",  "conc_corr_ugL + p_coprec_ugL; SRP without abiotic removal. NA for NH4-N",
+  "flag_delta_ca_neg",   "-",     "TRUE when the reach gained calcium; model not parameterised for this direction"
+)
+
+write_csv(bind_rows(dict_btc_nutrients, dict_coprec),
+          here("data_derived", "dictionary", "dict_btc_nutrients.csv"))
+dict_coprec
+```
+
+## 9.6 Sensitivity of the coprecipitation correction to σ
+
+`SIGMA_P` is the single most consequential constant in this correction —
+`p_coprec_ugL` is exactly linear in it — and the published estimates
+cluster into two physically distinct classes rather than forming one
+continuous range: field/river waters (0.055-0.095 µmol/m², River Frome,
+River Windrush, the Waterston chalk aquifer) and idealised synthetic
+Ca(HCO₃)₂ solutions (0.13-0.22 µmol/m²), which run 2-4× higher because
+they lack the competing solutes (Mg, Fe, dissolved organic matter) that
+occupy sorption sites in real water. `SIGMA_P` adopts the low end of the
+field cluster (River Frome, 5.5e-8 mol/m², following Cohen et al. 2013's
+identical choice for a directly analogous karst stream); this section
+carries the rest of that cluster and the laboratory ceiling forward as an
+explicit envelope rather than asserting the point estimate as the only
+possibility.
+
+```{r coprec-sigma-sensitivity}
+# p_coprec_molL was built as delta_ca_molL * (SIGMA_P * N_AVOG * D_CALCITE) * h_adsorbed,
+# so for fixed delta_ca and h it is exactly proportional to SIGMA_P: rescaling
+# the already-computed p_coprec_ugL is equivalent to, and cheaper than,
+# rebuilding the join for each candidate sigma.
+SIGMA_SENS <- c(
+  field_low   = 5.5e-8,  # River Frome (House et al. 1986a) -- ADOPTED, = SIGMA_P
+  field_high  = 9.5e-8,  # Waterston chalk aquifer (House et al. 1986a), field cluster upper end
+  lab_ceiling = 1.5e-7   # synthetic Ca(HCO3)2 (House & Donaldson 1986); Cohen et al. (2013)'s
+                         # laboratory upper-bound comparison value
+)
+stopifnot(isTRUE(all.equal(unname(SIGMA_SENS["field_low"]), SIGMA_P)))
+
+coprec_sigma_sens <- btc_nutrients %>%
+  filter(solute == "SRP", !is.na(p_coprec_ugL)) %>%
+  select(event_id, sample_btc, p_coprec_ugL, conc_corr_ugL) %>%
+  crossing(sigma_label = names(SIGMA_SENS)) %>%
+  mutate(
+    sigma_molm2       = SIGMA_SENS[sigma_label],
+    p_coprec_ugL_sens = p_coprec_ugL * (sigma_molm2 / SIGMA_P),
+    frac_of_srp_sens  = p_coprec_ugL_sens / conc_corr_ugL
+  )
+
+coprec_sigma_sens %>%
+  group_by(event_id, sigma_label) %>%
+  summarise(
+    sigma_umolm2        = first(sigma_molm2) * 1e6,
+    coprec_median_ugL   = median(p_coprec_ugL_sens, na.rm = TRUE),
+    frac_of_srp_median  = median(frac_of_srp_sens,  na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(id_cols = event_id, names_from = sigma_label,
+              values_from = c(coprec_median_ugL, frac_of_srp_median)) %>%
+  arrange(event_id) %>%
+  print(n = Inf)
+
+write_csv(coprec_sigma_sens, here("data_derived", "coprec_sigma_sensitivity.csv"))
+
+dict_coprec_sigma_sens <- tribble(
+  ~column, ~unit, ~description,
+  "sigma_label",       "-",      "field_low (adopted, River Frome) / field_high (Waterston aquifer) / lab_ceiling (synthetic solution)",
+  "sigma_molm2",        "mol/m2", "SIGMA_P value used for this row, from SIGMA_SENS",
+  "p_coprec_ugL_sens",  "ug/L",   "p_coprec_ugL rescaled to sigma_molm2; linear rescaling of the SIGMA_P-based value",
+  "frac_of_srp_sens",   "-",      "p_coprec_ugL_sens / conc_corr_ugL, at this sigma"
+)
+write_csv(dict_coprec_sigma_sens,
+          here("data_derived", "dictionary", "dict_coprec_sigma_sensitivity.csv"))
+```
+
+> **QAQC note.** This is the same check Cohen et al. (2013) ran on the
+> Ichetucknee: moving from the field value to the laboratory ceiling
+> should not be treated as a free parameter choice, because at the
+> laboratory end `frac_of_srp` can approach or exceed unity — the point
+> where the corrected series stops being a correction and becomes
+> mostly model output (§9.5's QAQC note). Where `frac_of_srp_sens` stays
+> small across the whole field-to-lab envelope, the choice of `SIGMA_P`
+> cannot change a conclusion; where it diverges sharply between
+> `field_low` and `lab_ceiling`, that divergence — not the point
+> estimate — is what belongs in the manuscript, alongside the physical
+> argument (§9.5) for why the field cluster is the appropriate class for
+> a stream rather than a synthetic solution.
+
+## 9.7 Event-level mass balance: does the correction respect the injected P mass?
+
+`frac_of_srp` (§9.5) is a per-grab, concentration-domain ratio: at each
+sampled instant, how large the correction is relative to the SRP
+measured at that instant. The `median(frac_of_srp)` printed there is the
+size of a *typical* correction, not the size of what the event actually
+lost — it weighs every grab equally regardless of when it was taken or
+how much water carried it, and `h_adsorbed` tracks phosphate speciation
+(§9.2), so `p_coprec_ugL` rises and falls with SRP across the curve while
+most events sample the tail more densely than the peak. A median across
+grabs is therefore not a mass balance.
+
+The mass-domain question — how much elemental P did coprecipitation
+remove from the whole event, and is that plausible against the P
+actually injected — needs a discharge-weighted integral over the sampled
+curve, the same construction `vignettes/02_integration.Rmd`'s Section 6
+already uses to get discharge from the NaCl mass balance (`hydro_probe`'s
+`integral_Ct_mgLs`, `pracma::trapz`):
+
+$$ m_{P,\mathrm{cop}} = Q \int_0^{T} C_{P,\mathrm{cop}}(t)\,dt
+   \qquad
+   m_{\mathrm{SRP}} = Q \int_0^{T} C_{\mathrm{corr}}(t)\,dt $$
+
+with $Q$ the adopted event discharge (`discharge_Ls`, treated as steady
+over the duration of a single slug event, matching that section's own
+convention) and the integral taken by trapezoidal rule over the sampled
+`time_since_release_s`. Two ratios follow:
+
+$$ f_{\mathrm{mass}} = \frac{m_{P,\mathrm{cop}}}{m_{\mathrm{SRP}}}
+   \qquad
+   \%_{\mathrm{injectate}} = 100\,\frac{m_{P,\mathrm{cop}}}{m_{P,\mathrm{added}}} $$
+
+`f_mass` is the mass-weighted analogue of `frac_of_srp` and is the
+number to compare it against. `%_injectate` is an independent physical
+check that does not use `conc_corr_ugL` at all — it asks what fraction
+of the elemental P mass released at the addition point was removed by
+coprecipitation before it passed the sampling station. `m_P,added`
+converts the phosphate-salt mass on the field sheet (`added_mass_PO4_g`,
+`molar_mass_P_nutrient`, `nutrient_addition_phosphate_data.csv`) to
+elemental P using the same molar-mass ratio, not the salt mass itself.
+
+`p_coprec_ugL` is integrated as measured, not clamped at zero: a
+negative value is a real model output at `flag_delta_ca_neg` events (the
+reach gained calcium — §9.5 already documents the model is not
+parameterised for that direction), and clipping it would silently
+overstate the correction there. `conc_corr_ugL` is clamped at zero in
+its integral, matching the convention already used for `nacl_mgL_grab`
+in `vignettes/02_integration.Rmd`'s Section 6 (a background-corrected
+concentration can dip slightly negative from measurement noise around a
+zero baseline; a transported mass cannot be physically negative).
+
+```{r coprec-mass-balance}
+p_added <- p_raw %>%
+  distinct(stream, date, added_mass_PO4_g, molar_mass_P_nutrient)
+stopifnot(!anyDuplicated(p_added[c("stream", "date")]))
+
+coprec_mass_balance <- btc_nutrients %>%
+  filter(solute == "SRP", !is.na(p_coprec_ugL)) %>%
+  select(event_id, stream, date, time_since_release_s, conc_corr_ugL,
+         p_coprec_ugL, flag_delta_ca_neg) %>%
+  left_join(events %>% select(event_id, discharge_Ls, flag_discharge_invalid),
+            by = "event_id") %>%
+  left_join(p_added, by = c("stream", "date")) %>%
+  arrange(event_id, time_since_release_s) %>%
+  group_by(event_id) %>%
+  summarise(
+    n                      = n(),
+    t_span_s               = diff(range(time_since_release_s, na.rm = TRUE)),
+    discharge_Ls           = first(discharge_Ls),
+    flag_discharge_invalid = first(flag_discharge_invalid),
+    flag_delta_ca_neg      = first(flag_delta_ca_neg),
+    # conc_corr_ugL can be NA on a grab even when p_coprec_ugL is
+    # defined (a bad concentration reading does not stop the
+    # geochemical calc, which does not use conc_corr_ugL at all).
+    # A single NA in the window propagates through pmax()/trapz()
+    # to NA for mass_srp_exported_ug and therefore frac_mass_coprec,
+    # while mass_p_coprec_ug and pct_of_injectate_coprec (below) are
+    # unaffected -- this flag names that asymmetry instead of
+    # leaving it to be reverse-engineered from a bare NA.
+    flag_conc_corr_na_in_window = anyNA(conc_corr_ugL),
+    added_mass_PO4_g       = first(added_mass_PO4_g),
+    molar_mass_P_nutrient  = first(molar_mass_P_nutrient),
+    # discharge-weighted trapezoidal integral over the sampled curve; NA
+    # where there are too few points to integrate or no valid discharge
+    # (mirrors the guard used for integral_Ct_mgLs in 02_integration.Rmd).
+    mass_srp_exported_ug = if (n >= 3 && t_span_s > 0 && !is.na(discharge_Ls))
+                             discharge_Ls *
+                               pracma::trapz(time_since_release_s, pmax(conc_corr_ugL, 0))
+                           else NA_real_,
+    mass_p_coprec_ug     = if (n >= 3 && t_span_s > 0 && !is.na(discharge_Ls))
+                             discharge_Ls *
+                               pracma::trapz(time_since_release_s, p_coprec_ugL)
+                           else NA_real_,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    frac_mass_coprec        = mass_p_coprec_ug / mass_srp_exported_ug,
+    mass_P_added_g          = added_mass_PO4_g * (M_P / molar_mass_P_nutrient),
+    pct_of_injectate_coprec = 100 * (mass_p_coprec_ug / 1e6) / mass_P_added_g,
+    flag_insufficient_samples     = n < 3,
+    flag_coprec_exceeds_injectate = !is.na(pct_of_injectate_coprec) &
+                                     pct_of_injectate_coprec > 100
+  ) %>%
+  arrange(desc(frac_mass_coprec))
+
+coprec_mass_balance %>%
+  select(event_id, n, discharge_Ls, frac_mass_coprec, pct_of_injectate_coprec,
+         flag_delta_ca_neg, flag_discharge_invalid, flag_insufficient_samples,
+         flag_coprec_exceeds_injectate, flag_conc_corr_na_in_window) %>%
+  print(n = Inf)
+
+write_csv(coprec_mass_balance, here("data_derived", "coprec_mass_balance.csv"))
+
+dict_coprec_mass_balance <- tribble(
+  ~column, ~unit, ~description,
+  "event_id",                     "-",     "Event key",
+  "n",                             "-",     "Number of SRP grabs with a defined p_coprec_ugL",
+  "t_span_s",                      "s",     "Time span covered by those grabs; integration domain",
+  "discharge_Ls",                  "L/s",   "Adopted event discharge (events$discharge_Ls), treated as steady over the event",
+  "mass_srp_exported_ug",          "ug",    "discharge_Ls * trapz(time_since_release_s, pmax(conc_corr_ugL, 0)); background-corrected SRP mass transported past the station over the sampled window",
+  "mass_p_coprec_ug",              "ug",    "discharge_Ls * trapz(time_since_release_s, p_coprec_ugL); P mass removed by coprecipitation over the sampled window. Not clamped at zero -- see prose",
+  "frac_mass_coprec",              "-",     "mass_p_coprec_ug / mass_srp_exported_ug; mass-weighted, event-integrated analogue of the per-grab median frac_of_srp in Sec. 9.5",
+  "added_mass_PO4_g",              "g",     "Mass of the phosphate salt added, nutrient_addition_phosphate_data.csv",
+  "molar_mass_P_nutrient",         "g/mol", "Molar mass of the salt added (type_P)",
+  "mass_P_added_g",                "g",     "added_mass_PO4_g * (M_P / molar_mass_P_nutrient); elemental P mass injected",
+  "pct_of_injectate_coprec",       "%",     "100 * (mass_p_coprec_ug/1e6) / mass_P_added_g; independent check, does not use conc_corr_ugL",
+  "flag_delta_ca_neg",             "-",     "Carried from Sec. 9.5: TRUE when the reach gained calcium (model not parameterised for that direction)",
+  "flag_discharge_invalid",        "-",     "Carried from events: TRUE when no valid discharge estimate exists for this event",
+  "flag_insufficient_samples",     "-",     "TRUE when n < 3 (cannot integrate); mass columns are NA",
+  "flag_coprec_exceeds_injectate", "-",     "TRUE when pct_of_injectate_coprec > 100 -- physically impossible, flags a remaining error rather than a real effect",
+  "flag_conc_corr_na_in_window",   "-",     "TRUE when any conc_corr_ugL in the window is NA; frac_mass_coprec is then NA but pct_of_injectate_coprec (independent of conc_corr_ugL) is not -- expected, not a bug"
+)
+
+write_csv(dict_coprec_mass_balance,
+          here("data_derived", "dictionary", "dict_coprec_mass_balance.csv"))
+
+dict_coprec_mass_balance
+```
+
+> **QAQC note.** `frac_mass_coprec` is the number that should be compared
+> to the per-grab median in §9.5, not treated as a replacement for it —
+> a large gap between the two says the loss is concentrated in part of
+> the curve the median under- or over-weights, which is itself worth
+> reporting. `pct_of_injectate_coprec` is the stronger check: it is built
+> from the addition record alone (`added_mass_PO4_g`,
+> `molar_mass_P_nutrient`) and the coprecipitation model, with no
+> dependence on the measured downstream SRP series, so it cannot inherit
+> an error from `conc_corr_ugL`. Any `flag_coprec_exceeds_injectate ==
+> TRUE` means the model is predicting more P removed than was released —
+> physically impossible — and should be read as evidence of a remaining
+> unit or join error, not as a real effect, per the same standard applied
+> to `SIGMA_P` and the PHREEQC unit fixes earlier in this section.
+>
+> `flag_conc_corr_na_in_window` explains the one asymmetric case:
+> `frac_mass_coprec` can be `NA` while `pct_of_injectate_coprec` is
+> not, because a single `NA` in `conc_corr_ugL` propagates through
+> the `mass_srp_exported_ug` integral but `mass_p_coprec_ug` never
+> uses `conc_corr_ugL` at all. This is expected behaviour, not a
+> second bug.
+>
+> **A note on circularity.** `p_coprec_ugL` — and therefore
+> `conc_corr_coprec_ugL` — is a deterministic function of
+> `delta_ca_mgL` (§9.2). Any uptake metric computed from the corrected
+> series (Sw, Vf, areal uptake, or otherwise) therefore carries a
+> component that is mechanically linear in ΔCa by construction,
+> independent of any real biological or abiotic process. Comparing that
+> metric, once corrected, back against ΔCa or calcium transfer and
+> reporting agreement as confirmation of the coprecipitation mechanism
+> is circular — the correction was built from ΔCa, so some relationship
+> between the two is guaranteed rather than discovered. The evidence
+> that is not circular is the relationship measured on the
+> *uncorrected* series (nothing in `conc_corr_ugL` depends on ΔCa) and
+> the independent mass-balance check above (`pct_of_injectate_coprec`,
+> built from the addition record, not from ΔCa or the corrected
+> concentration). A relationship that is absent uncorrected and appears
+> only after applying the correction is particularly worth treating
+> with suspicion for this reason before being reported as a finding —
+> it is at least as consistent with the correction's own linear
+> structure as with a newly-revealed process.

@@ -1,0 +1,833 @@
+---
+title: "01 — QAQC of HOBO conductivity data from nutrient addition slugs"
+subtitle: "Karst streams, dry season 2023"
+author: "Kauan Fonseca"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: false
+    code_folding: show
+    theme: flatly
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.width = 10, fig.height = 6
+)
+
+library(readxl)
+library(readr)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(stringr)
+library(tibble)
+library(lubridate)
+library(hms)
+library(ggplot2)
+library(plotly)
+library(here)
+```
+
+# Scope
+
+This document covers **instrument-level QAQC only**: import of the raw
+HOBO conductivity exports, harmonization of headers, recalculation of
+specific conductance, anchoring of each series to its tracer addition,
+interactive selection of the slug window, and export of a clean
+high-resolution conservative-tracer series.
+
+It deliberately stops before any cross-instrument work. Merging with the
+nutrient grab samples, reconciling the handheld probe against the logger,
+correcting SRP for CaCO₃ co-precipitation, and building the analysis
+tables are handled in `02_integration.Rmd`. Visual review of the final
+breakthrough curves lives in `03_btc_review.Rmd`.
+
+**Output of this document:** `data_derived/btc_conservative.csv` (+ RDS)
+and `data_derived/events_hobo.csv`.
+
+# Sampling protocol
+
+Specific conductance (SpC), full-range conductivity, and water
+temperature were recorded continuously (5–10 s intervals) with HOBO
+U24-001 conductivity loggers deployed during combined NaCl + nutrient
+slug releases. Loggers were deployed at a single downstream station for
+one-station slugs, or at paired upstream/downstream stations. Some
+streams were sampled on a single day; others include multiple sampling
+dates or repeated releases within the same day.
+
+All timestamps in this pipeline are standardised to Brasília time
+(`America/Sao_Paulo`, UTC−3), which is the logger's native clock.
+Field notebooks recorded local Mato Grosso time (`America/Cuiaba`,
+UTC−4); conversion happens at the point of import and is documented
+where it occurs.
+
+---
+
+# 1. Import raw HOBO exports
+
+Raw HOBO data were exported per stream and sampling day as individual
+`.xlsx` files. Each file is imported and stacked into a single raw data
+frame, retaining the source file name as a traceability field.
+
+```{r list-files}
+dir_hobo <- here("data", "hobo_raw")
+
+files_all <- list.files(dir_hobo, pattern = "\\.xlsx$", full.names = TRUE)
+
+tibble(file = basename(files_all))
+```
+
+## 1.1 Excluded deployments
+
+```{r exclude-files}
+# Files excluded from the pipeline, with the reason recorded so the
+# exclusion is auditable rather than silent.
+exclusions <- tribble(
+  ~file,                    ~reason,
+  "SpC_CD_061023.xlsx",     "Export contained columns from multiple logger deployment sessions (light intensity and dissolved oxygen unrelated to the slug), preventing extraction of a single SpC/temperature series. CD 2023-10-09 is used as the valid record for this stream."
+)
+
+files <- files_all[!basename(files_all) %in% exclusions$file]
+
+tibble(
+  excluded_file  = exclusions$file,
+  found_in_data  = exclusions$file %in% basename(files_all)
+)
+
+length(files_all); length(files)
+```
+
+> **QAQC note.** `SpC_CD_061023.xlsx` was removed from `data/hobo_raw/`
+> during project reorganisation, so the filter above is currently a
+> no-op. It is retained as an explicit, documented rule: if the file is
+> ever restored to the folder it will still be excluded, and the reason
+> travels with the code.
+
+```{r import-all}
+hobo_raw_list <- files %>%
+  set_names(basename(.)) %>%
+  map(~ read_excel(.x, sheet = 1))
+
+hobo_raw_all <- bind_rows(hobo_raw_list, .id = "source_file")
+
+nrow(hobo_raw_all)
+```
+
+# 2. Inspect raw structure
+
+```{r inspect-columns}
+map(hobo_raw_list, names)
+```
+
+```{r inspect-dims}
+imap_dfr(hobo_raw_list, ~ tibble(
+  source_file = .y, n_rows = nrow(.x), n_cols = ncol(.x)
+))
+```
+
+# 3. Standardise column names
+
+Header text varies across files because of the HOBOware interface
+language (Portuguese vs English) and because the logger serial number is
+embedded in the header (e.g. `#20835561`). A regex mapping brings every
+file to a common schema. The serial is extracted *before* renaming, so
+it is preserved as a metadata field.
+
+```{r fn-standardize}
+extract_logger_serial <- function(df) {
+  serial <- names(df) %>% str_extract("#\\d+") %>% na.omit() %>% unique()
+
+  if (length(serial) == 0) return(NA_character_)
+  if (length(serial) > 1) {
+    warning("Multiple logger serials in one file: ", paste(serial, collapse = ", "))
+    return(paste(str_remove(serial, "#"), collapse = "; "))
+  }
+  str_remove(serial, "#")
+}
+
+standardize_hobo_names <- function(df) {
+  names(df) <- names(df) %>%
+    str_replace("(?i)^date$", "date_raw") %>%
+    str_replace("(?i)^time$", "time_raw") %>%
+    str_replace("(?i)^(Full Range|Gama Completa).*", "full_range_uscm") %>%
+    str_replace("(?i)^Temp\\.?\\s*\\(°C\\).*", "temp_c") %>%
+    str_replace("(?i)^Specific Conductance.*", "spc_hoboware_uscm") %>%
+    str_replace("(?i)^(Coupler Detached|Acoplador Desligado).*", "coupler_detached") %>%
+    str_replace("(?i)^(Coupler Attached|Acoplador Ligado).*", "coupler_attached") %>%
+    str_replace("(?i)^(Host Connected|Anfitrião Ligado).*", "host_connected") %>%
+    str_replace("(?i)^(Stopped|Parado)$", "stopped") %>%
+    str_replace("(?i)^(End Of File|Fim Do Ficheiro).*", "end_of_file")
+  df
+}
+
+logger_serials <- map_chr(hobo_raw_list, extract_logger_serial)
+hobo_std_list  <- map(hobo_raw_list, standardize_hobo_names)
+
+tibble(source_file = names(logger_serials), logger_serial = logger_serials)
+```
+
+```{r check-schema}
+# every file must expose the three columns the pipeline depends on
+map_dfr(hobo_std_list, ~ tibble(
+  has_datetime  = all(c("date_raw", "time_raw") %in% names(.x)),
+  has_fullrange = "full_range_uscm" %in% names(.x),
+  has_temp      = "temp_c" %in% names(.x)
+), .id = "source_file")
+```
+
+# 4. File-level metadata
+
+```{r extract-metadata}
+file_metadata <- tibble(source_file = names(hobo_std_list)) %>%
+  mutate(
+    stream = str_extract(source_file, "(?<=SpC_)[A-Z]{2}"),
+    station = case_when(
+      str_detect(source_file, "upstream")  ~ "upstream",
+      # "dowstream" (sic) is the typo baked into the original raw filenames;
+      # matched alongside the correctly-spelled form so a new, correctly
+      # named file (e.g. SR 2023-10-09) is not silently left as NA.
+      str_detect(source_file, "dow(n)?stream") ~ "downstream",
+      TRUE ~ NA_character_
+    ),
+    date_str      = str_extract(source_file, "\\d{6}"),
+    date          = dmy(date_str),
+    logger_serial = logger_serials[source_file]
+  ) %>%
+  select(-date_str)
+
+file_metadata
+```
+
+```{r fix-cb-date}
+# SpC_CB_100823.xlsx: filename follows ddmmyy, but the day and month
+# digits were transposed when the file was named. The true event date is
+# 2023-10-08, confirmed against the field notebook. CB was sampled on two
+# separate dates (2023-09-07 and 2023-10-08); both are valid events.
+file_metadata <- file_metadata %>%
+  mutate(date = if_else(source_file == "SpC_CB_100823.xlsx",
+                        as.Date("2023-10-08"), date))
+
+file_metadata %>% filter(stream == "CB")
+```
+
+```{r stack-standardized}
+hobo_std_all <- bind_rows(hobo_std_list, .id = "source_file") %>%
+  left_join(file_metadata, by = "source_file")
+
+glimpse(hobo_std_all)
+```
+
+# 5. Datetime and specific conductance
+
+```{r build-datetime}
+# HOBOware exports Date and Time as two full datetimes carrying the same
+# calendar date; recombine into one clean POSIXct in Brasília time.
+hobo_std_all <- hobo_std_all %>%
+  mutate(
+    datetime = as.POSIXct(
+      paste(format(as.Date(date_raw), "%Y-%m-%d"), format(time_raw, "%H:%M:%S")),
+      format = "%Y-%m-%d %H:%M:%S", tz = "America/Sao_Paulo"
+    )
+  ) %>%
+  arrange(source_file, datetime)
+
+range(hobo_std_all$datetime, na.rm = TRUE)
+sum(is.na(hobo_std_all$datetime))
+```
+
+```{r recalc-spc}
+# Temperature compensation: 2 % per °C, referenced to 25 °C
+# SpC = full_range / (1 + 0.02 * (temp_c - 25))
+hobo_std_all <- hobo_std_all %>%
+  mutate(spc_uscm = full_range_uscm / (1 + 0.02 * (temp_c - 25)))
+```
+
+```{r compare-spc-sources}
+# how far does the recalculated value sit from HOBOware's own?
+hobo_std_all %>%
+  filter(!is.na(spc_hoboware_uscm)) %>%
+  group_by(source_file) %>%
+  summarise(
+    n              = n(),
+    median_diff    = median(spc_hoboware_uscm - spc_uscm, na.rm = TRUE),
+    max_abs_diff   = max(abs(spc_hoboware_uscm - spc_uscm), na.rm = TRUE),
+    hoboware_min   = min(spc_hoboware_uscm, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+> **QAQC note.** HOBOware's pre-calculated Specific Conductance
+> (`spc_hoboware_uscm`) was unreliable for at least one deployment
+> (RS, 2023-10-11), flatlining at 1 µS/cm through the peak of the slug
+> despite plausible `full_range_uscm` and `temp_c`. Rather than repair
+> one file, `spc_uscm` is recalculated for **every** event directly from
+> `full_range_uscm` and `temp_c` using the standard 2 %/°C compensation
+> referenced to 25 °C. The HOBOware column is retained only for the
+> diagnostic comparison above and is never used downstream.
+
+# 6. Event metadata
+
+Tracer masses, reach geometry and release times come from the field
+sheet (`slugs_kauan_clean.csv`).
+
+```{r read-field-sheet}
+field_sheet <- read_csv(here("data", "field", "slugs_kauan_clean.csv"),
+                        show_col_types = FALSE)
+
+field_sheet %>% distinct(stream, date) %>% arrange(stream, date)
+```
+
+```{r addition-times}
+# Release times were written down in Mato Grosso local time (UTC-4) and
+# are converted here, at the point of import, to Brasília time (UTC-3),
+# the logger's clock and the standard for the rest of the pipeline.
+addition_times <- field_sheet %>%
+  filter(time_phase == "release") %>%
+  group_by(stream, date) %>%
+  summarise(addition_time_local = first(time_hms), .groups = "drop") %>%
+  mutate(
+    addition_datetime = with_tz(
+      as.POSIXct(paste(format(date, "%Y-%m-%d"), addition_time_local),
+                 format = "%Y-%m-%d %H:%M:%S", tz = "America/Cuiaba"),
+      tzone = "America/Sao_Paulo"
+    ),
+    # re-extract date and time already in Brasília time; covers the rare
+    # case of a release close to midnight rolling the calendar date
+    addition_time = hms::as_hms(addition_datetime),
+    date          = as.Date(addition_datetime)
+  ) %>%
+  select(stream, date, addition_time, addition_datetime)
+
+event_metadata <- field_sheet %>%
+  distinct(stream, date, nacl_mass_g, amonium_added_g, phophate_added_g,
+           reach_length_m, reach_mean_width_m) %>%
+  left_join(addition_times, by = c("stream", "date"))
+
+# must be empty: one metadata row per stream-date
+event_metadata %>% count(stream, date) %>% filter(n > 1)
+
+event_metadata
+```
+
+```{r manual-events}
+# SA 2023-10-10 was captured by the logger but never entered in the
+# field sheet; transcribed here from the field notebook.
+manual_events <- tribble(
+  ~stream, ~date,                 ~addition_time_local,    ~nacl_mass_g, ~amonium_added_g, ~phophate_added_g, ~reach_length_m, ~reach_mean_width_m,
+  "SA",    as.Date("2023-10-10"), hms::as_hms("12:45:00"), 3139,         155,              298,               200,             10
+) %>%
+  mutate(
+    addition_datetime = with_tz(
+      as.POSIXct(paste(format(date, "%Y-%m-%d"), addition_time_local),
+                 format = "%Y-%m-%d %H:%M:%S", tz = "America/Cuiaba"),
+      tzone = "America/Sao_Paulo"
+    ),
+    addition_time = hms::as_hms(addition_datetime),
+    date          = as.Date(addition_datetime)
+  ) %>%
+  select(-addition_time_local)
+
+event_metadata <- bind_rows(event_metadata, manual_events) %>%
+  arrange(stream, date)
+
+event_metadata
+```
+
+> **QAQC note — SR 2023-10-09 (downstream station).** A second SR
+> deployment, two days before the nutrient-addition event already in the
+> field sheet (SR 2023-10-11). This one was a discharge-characterisation
+> slug only (no nutrients added); the field sheet has no row for it, so
+> it is added manually below, mirroring the SA 2023-10-10 case above.
+> `reach_length_m = 72` is not a new value — it is the same downstream
+> distance already on record for SR 2023-10-11, confirming the two
+> deployments share a station. `nacl_mass_g = 3101` is from Kauan's field
+> summary for this slug.
+>
+> The release time was recovered, not inferred: an earlier export of this
+> same deployment (`data/field/SR_discharge_091023_downstream.xlsx`,
+> before Kauan re-exported it with temperature added, which is what is
+> imported above) carried its own `time since release` column, zeroed at
+> **2023-10-09 17:33:10** Brasília time — inside the recalled 17:30-18:30
+> window, and directly on the logger's own clock, so no Cuiabá
+> conversion applies. That anchor puts the SpC peak (18:15:50) at
+> t = 2560 s, matching the peak time this project already had on record
+> for this event before the file was re-exported. It is adopted here.
+> **QAQC note — SR 2023-10-09 upstream station.** The same logger serial
+> (`#20835564`) that recorded this slug also runs continuously for daily
+> SpC/O₂ metabolism monitoring — that dual purpose is the reason its raw
+> file carries an unrelated sheet name and spans a full ~8 h deployment
+> rather than a tight slug window; it is not a different, unrelated
+> event. `reach_length_m = 52` is Kauan's approximate field distance
+> (unlike the 72 m downstream value, this one is not cross-confirmed
+> against an independent record, so it carries more uncertainty).
+> `addition_datetime` is shared with the downstream station rather than
+> read from this file's own `time since release` column: both stations
+> sample the same single injection, so there is only one true release
+> instant, and this file's own internal zero-point (16:34:00) does not
+> agree with it (see discussion in `02`). Width is not separately known
+> for this station and reuses the stream-level 2 m.
+>
+> `event_metadata` is keyed by `stream + date` only (Section 9 is what
+> resolves the `station` split into two distinct `event_id`s), so it
+> cannot carry two different `reach_length_m` values for the same
+> stream-date the way it would need to for 72 m (downstream) vs 52 m
+> (upstream) — the existing RA 2023-10-05 downstream/upstream pair has
+> this same limitation and both already share one `reach_length_m` in
+> `events_hobo`. The row below carries the downstream (72 m) value,
+> consistent with that precedent; the upstream-specific 52 m is applied
+> as a per-`event_id` override in `02`, where it is used (only the
+> logger integral, not distance, drives `discharge_Ls_logger`, but
+> distance does drive `water_velocity_ms`).
+```{r manual-events-sr}
+manual_events_sr <- tribble(
+  ~stream, ~date,                 ~nacl_mass_g, ~amonium_added_g, ~phophate_added_g, ~reach_length_m, ~reach_mean_width_m,
+  "SR",    as.Date("2023-10-09"), 3101,         0,                0,                 72,              2
+) %>%
+  mutate(
+    addition_datetime = as.POSIXct("2023-10-09 17:33:10", tz = "America/Sao_Paulo"),
+    addition_time     = hms::as_hms(addition_datetime)
+  )
+
+event_metadata <- bind_rows(event_metadata, manual_events_sr) %>%
+  arrange(stream, date)
+
+event_metadata %>% filter(stream == "SR")
+```
+
+```{r coverage-check}
+# which logged events have no field-sheet metadata, and vice versa?
+file_metadata %>%
+  distinct(stream, date) %>%
+  mutate(has_logger = TRUE) %>%
+  full_join(event_metadata %>% distinct(stream, date) %>% mutate(has_metadata = TRUE),
+            by = c("stream", "date")) %>%
+  arrange(stream, date)
+```
+
+## 6.1 Background reference from the handheld probe
+
+```{r background-reference}
+background_reference <- field_sheet %>%
+  filter(time_phase == "release") %>%
+  distinct(stream, date, backg_spc_uScm) %>%
+  rename(background_spc_probe = backg_spc_uScm) %>%
+  bind_rows(tibble(stream = "SA", date = as.Date("2023-10-10"),
+                   background_spc_probe = 5.1)) %>%
+  arrange(stream, date)
+
+background_reference
+```
+
+> **QAQC note.** `background_spc_probe` is **not** derived from the
+> logger. It is the specific conductance read with the handheld probe
+> (Hanna HI12883 or YSI) at the moment of release, kept here strictly as
+> an independent reference value. It is useful for detecting drift
+> between the two instruments but is not assumed to be numerically
+> identical to the logger's own baseline. The probe-vs-logger
+> reconciliation is carried out in `02_integration.Rmd`.
+
+```{r join-meta}
+hobo_with_meta <- hobo_std_all %>%
+  left_join(event_metadata,       by = c("stream", "date")) %>%
+  left_join(background_reference, by = c("stream", "date"))
+
+hobo_with_meta %>% count(source_file, stream, date, station)
+```
+
+# 7. Tracer addition anchors
+
+Most events had a single combined NaCl + nutrient release. RA on
+2023-09-06 is the exception: phosphorus and nitrogen were added
+separately, at 14:30 and 16:45, with the logger deployed from 13:39 to
+18:35. **These two times were already recorded in Brasília time and must
+not pass through the Cuiabá conversion applied to every other event.**
+
+```{r addition-anchor}
+addition_anchor_standard <- event_metadata %>%
+  filter(!(stream == "RA" & date == as.Date("2023-09-06"))) %>%
+  transmute(stream, date, slug_label = NA_character_,
+            addition_datetime,
+            label = if_else(coalesce(amonium_added_g, 0) == 0 & coalesce(phophate_added_g, 0) == 0,
+                            "NaCl-only discharge slug", "NaCl + nutrient release"))
+
+addition_anchor_ra <- tribble(
+  ~stream, ~date,                 ~slug_label, ~addition_datetime,                                        ~label,
+  "RA",    as.Date("2023-09-06"), "P",  as.POSIXct("2023-09-06 14:30:00", tz = "America/Sao_Paulo"), "P addition",
+  "RA",    as.Date("2023-09-06"), "N",  as.POSIXct("2023-09-06 16:45:00", tz = "America/Sao_Paulo"), "N addition"
+)
+
+addition_anchor <- bind_rows(addition_anchor_standard, addition_anchor_ra) %>%
+  arrange(stream, date, slug_label)
+
+addition_anchor
+```
+
+> **QAQC note.** `event_metadata` holds one row per stream-date, which
+> is correct for reach geometry and total masses but wrong as a time
+> anchor for RA 2023-09-06, where two slugs share a calendar date. The
+> anchor table above is keyed on `stream + date + slug_label` and is the
+> **only** source of `addition_datetime` used to compute elapsed time.
+> Any `addition_datetime` inherited through the event-level join is
+> dropped before the anchor is applied (Section 9).
+
+## 7.1 Full raw series review, before trimming
+
+```{r plot-full-series}
+p_full <- hobo_with_meta %>%
+  ggplot(aes(x = datetime, y = spc_uscm)) +
+  geom_line(linewidth = 0.3) +
+  geom_vline(
+    data = addition_anchor %>%
+      inner_join(file_metadata %>% select(source_file, stream, date),
+                 by = c("stream", "date")),
+    aes(xintercept = addition_datetime),
+    colour = "darkgreen", linetype = "dashed"
+  ) +
+  facet_wrap(~ source_file, scales = "free") +
+  labs(x = NULL, y = "SpC (µS/cm)",
+       title = "Full raw HOBO series per deployment",
+       subtitle = "Dashed green = tracer addition") +
+  theme_minimal(base_size = 10)
+
+ggplotly(p_full)
+```
+
+# 8. Interactive slug window selection
+
+The slug window (release to return to background, or to logger
+retrieval) was selected per event with a dedicated Shiny application,
+`R/app_slug_interval.R`, which brushes over the high-resolution series
+with zoom and hover inspection of exact SpC/datetime values. It writes
+one trimmed CSV per event to `data/slug_trimmed/` and appends every
+selection to `data/slug_trimmed_log.csv`.
+
+```{r save-for-shiny}
+saveRDS(hobo_with_meta, here("data", "hobo_with_meta.rds"))
+```
+
+> Run `R/app_slug_interval.R` at this point if the trimmed files need to
+> be regenerated. They are version-controlled, so the rest of this
+> document knits without re-running the app.
+
+## 8.1 SR 2023-10-09 (downstream): window built without the Shiny app
+
+This single new event was not run through `app_slug_interval.R` — the
+interactive app cannot run inside this session. It did not need real
+trimming judgement anyway: the raw export already opens on a flat
+pre-release baseline and closes on a flat post-recession baseline, so
+the whole file *is* the slug window. Only the trailing non-numeric sentinel
+rows the logger appends past the last measurement (a stray `"Logged"`
+text token, no `full_range_uscm`) are dropped. The result is written
+directly to `data/slug_trimmed/`, in the same column layout as every
+other trimmed file, so Section 9 onward treats it identically to a
+Shiny-produced window; the substitution is logged as its own row in
+`data/slug_trimmed_log.csv` rather than silently blended in.
+
+```{r sr-manual-trim}
+sr_window <- hobo_with_meta %>%
+  filter(stream == "SR", station == "downstream", date == as.Date("2023-10-09")) %>%
+  filter(!is.na(full_range_uscm), !is.na(temp_c)) %>%
+  arrange(datetime) %>%
+  # the last logged row (19:18:20) jumps from 501 to 539 uS/cm in a single
+  # 10 s step, right after five consecutive readings at the pre-release
+  # baseline (i.e. the tracer had already fully returned to background) —
+  # a sensor-retrieval artefact, not water. An earlier export of this same
+  # file that still carried a precomputed NaCl column showed the identical
+  # spike at this exact timestamp, so it is not an artefact of this
+  # re-import. Dropped, with the reason kept here rather than silently.
+  filter(datetime != max(datetime)) %>%
+  transmute(
+    source_file, date_raw, time_raw, full_range_uscm, temp_c,
+    spc_calculated_uscm = spc_uscm,
+    coupler_detached = NA_real_, coupler_attached = NA_real_,
+    host_connected = NA_real_, stopped = NA_real_, end_of_file = NA_real_,
+    stream, station, date, logger_serial, datetime, spc_uscm,
+    nacl_mass_g, amonium_added_g, phophate_added_g,
+    reach_length_m, reach_mean_width_m,
+    addition_time, addition_datetime,
+    background_spc = background_spc_probe
+  )
+
+nrow(sr_window); range(sr_window$datetime)
+
+write_csv(sr_window, here("data", "slug_trimmed", "slug_SR_20231009_downstream.csv"))
+
+sr_log_row <- tibble(
+  source_file   = "SpC_SR_091023_downstream.xlsx",
+  stream        = "SR",
+  date          = as.Date("2023-10-09"),
+  station       = "downstream",
+  start_datetime = min(sr_window$datetime),
+  end_datetime   = max(sr_window$datetime),
+  n_obs          = nrow(sr_window),
+  output_file    = "slug_SR_20231009_downstream.csv",
+  label          = "built directly from the raw export (Shiny app not run this session); see Sec. 8.1"
+)
+
+log_path <- here("data", "slug_trimmed_log.csv")
+existing_log <- read_csv(log_path, show_col_types = FALSE)
+if (!sr_log_row$output_file %in% existing_log$output_file) {
+  write_csv(bind_rows(existing_log, sr_log_row), log_path)
+}
+```
+
+## 8.2 SR 2023-10-09 (upstream): same treatment, second station
+
+This logger runs continuously for daily metabolism monitoring (Section
+6 note above), so its raw file spans a full ~8 h deployment rather than
+a tight slug window; the whole thing is kept, since `drifting_background()`
+and the 5%-of-peak return cutoff in `02` handle a long flat pre/post
+baseline without distorting the integral, and trimming it by hand here
+would just be guessing at a window `03` review can check visually
+instead. `reach_length_m` is overridden to 52 m at export (the 72 m
+inherited via `event_metadata`, shared with the downstream row for the
+reason noted in Section 6, is wrong for this station).
+
+```{r sr-manual-trim-upstream}
+sr_window_up <- hobo_with_meta %>%
+  filter(stream == "SR", station == "upstream", date == as.Date("2023-10-09")) %>%
+  filter(!is.na(full_range_uscm), !is.na(temp_c)) %>%
+  arrange(datetime) %>%
+  transmute(
+    source_file, date_raw, time_raw, full_range_uscm, temp_c,
+    spc_calculated_uscm = spc_uscm,
+    coupler_detached = NA_real_, coupler_attached = NA_real_,
+    host_connected = NA_real_, stopped = NA_real_, end_of_file = NA_real_,
+    stream, station, date, logger_serial, datetime, spc_uscm,
+    nacl_mass_g, amonium_added_g, phophate_added_g,
+    reach_length_m = 52, reach_mean_width_m,
+    addition_time, addition_datetime,
+    background_spc = background_spc_probe
+  )
+
+nrow(sr_window_up); range(sr_window_up$datetime)
+
+write_csv(sr_window_up, here("data", "slug_trimmed", "slug_SR_20231009_upstream.csv"))
+
+sr_log_row_up <- tibble(
+  source_file   = "SpC_SR_091023_upstream.xlsx",
+  stream        = "SR",
+  date          = as.Date("2023-10-09"),
+  station       = "upstream",
+  start_datetime = min(sr_window_up$datetime),
+  end_datetime   = max(sr_window_up$datetime),
+  n_obs          = nrow(sr_window_up),
+  output_file    = "slug_SR_20231009_upstream.csv",
+  label          = "built directly from the raw export (Shiny app not run this session); see Sec. 8.2"
+)
+
+existing_log <- read_csv(log_path, show_col_types = FALSE)
+if (!sr_log_row_up$output_file %in% existing_log$output_file) {
+  write_csv(bind_rows(existing_log, sr_log_row_up), log_path)
+}
+```
+
+```{r selection-log}
+read_csv(here("data", "slug_trimmed_log.csv"), show_col_types = FALSE)
+```
+
+# 9. Import trimmed windows and anchor elapsed time
+
+```{r import-trimmed}
+trimmed_files <- list.files(here("data", "slug_trimmed"),
+                            pattern = "\\.csv$", full.names = TRUE)
+
+hobo_slug <- trimmed_files %>%
+  set_names(basename(.)) %>%
+  map(~ read_csv(.x, show_col_types = FALSE)) %>%
+  bind_rows(.id = "trimmed_file") %>%
+  rename(any_of(c(background_spc_probe = "background_spc"))) %>%
+  mutate(
+    datetime   = with_tz(datetime, tzone = "America/Sao_Paulo"),
+    slug_label = str_extract(trimmed_file, "(?<=_)[PN](?=\\.csv$)")
+  )
+
+names(hobo_slug)
+
+hobo_slug %>% count(trimmed_file, stream, date, station, slug_label)
+```
+
+> **QAQC note.** `write_csv()`/`read_csv()` preserve the correct absolute
+> instant when round-tripping `POSIXct`, but `read_csv()` re-labels the
+> timezone as UTC on import. Because Brasília is UTC−3, displayed times
+> appeared three hours late even though elapsed-time arithmetic remained
+> correct. `with_tz()` restores the display timezone without shifting the
+> underlying instant.
+
+```{r reanchor}
+hobo_slug <- hobo_slug %>%
+  # drop the event-level anchor inherited from the trimmed export and
+  # replace it with the slug-level anchor from Section 7
+  select(-any_of(c("addition_datetime", "addition_time"))) %>%
+  left_join(addition_anchor, by = c("stream", "date", "slug_label")) %>%
+  mutate(
+    time_since_release_s = as.numeric(difftime(datetime, addition_datetime,
+                                               units = "secs")),
+    event_id = paste(
+      stream, format(date, "%Y%m%d"),
+      coalesce(slug_label, station, "single"), sep = "_"
+    )
+  )
+
+# must be empty: every trimmed window resolves to exactly one anchor
+hobo_slug %>% filter(is.na(addition_datetime)) %>% distinct(trimmed_file)
+```
+
+```{r check-event-id}
+hobo_slug %>%
+  distinct(trimmed_file, event_id) %>%
+  mutate(matches_filename = event_id == str_remove(str_remove(trimmed_file, "^slug_"), "\\.csv$"))
+```
+
+# 10. QAQC checks on the trimmed series
+
+```{r qaqc-window-summary}
+window_summary <- hobo_slug %>%
+  group_by(event_id, stream, date, station, slug_label) %>%
+  summarise(
+    n_obs            = n(),
+    start            = min(datetime),
+    end              = max(datetime),
+    duration_min     = as.numeric(difftime(max(datetime), min(datetime), units = "mins")),
+    t_start_s        = min(time_since_release_s),
+    t_end_s          = max(time_since_release_s),
+    dt_median_s      = median(as.numeric(diff(sort(datetime))), na.rm = TRUE),
+    dt_max_s         = max(as.numeric(diff(sort(datetime))), na.rm = TRUE),
+    spc_min          = min(spc_uscm, na.rm = TRUE),
+    spc_max          = max(spc_uscm, na.rm = TRUE),
+    spc_at_end       = last(spc_uscm[order(datetime)]),
+    t_peak_s         = time_since_release_s[which.max(spc_uscm)],
+    n_na_spc         = sum(is.na(spc_uscm)),
+    n_before_release = sum(time_since_release_s < 0),
+    .groups = "drop"
+  )
+
+window_summary
+```
+
+```{r qaqc-flags}
+window_flags <- window_summary %>%
+  transmute(
+    event_id,
+    # window opens after the release: no pre-slug baseline captured
+    flag_no_pre_release = n_before_release == 0,
+    # peak sits in the first or last 10 % of the window: likely clipped
+    flag_peak_at_edge   = t_peak_s < t_start_s + 0.10 * (t_end_s - t_start_s) |
+                          t_peak_s > t_start_s + 0.90 * (t_end_s - t_start_s),
+    # series still well above its own minimum at the end: truncated tail,
+    # which biases the integral used for discharge and residence time
+    flag_truncated_tail = (spc_at_end - spc_min) > 0.15 * (spc_max - spc_min),
+    # logging gap far above the nominal interval
+    flag_logging_gap    = dt_max_s > 5 * dt_median_s,
+    flag_na_present     = n_na_spc > 0
+  )
+
+window_flags
+
+window_flags %>%
+  pivot_longer(-event_id, names_to = "flag", values_to = "raised") %>%
+  filter(raised) %>%
+  arrange(event_id)
+```
+
+> **QAQC note.** `flag_truncated_tail` matters most for this dataset:
+> transient-storage inverse modelling is disproportionately sensitive to
+> the falling limb, and a window closed before the tracer returns to
+> background will bias the storage parameters. Flagged events are not
+> dropped here — they are carried into `02_integration.Rmd` as an
+> explicit column so the decision to extrapolate, truncate, or exclude
+> is made once, in the open, at the analysis stage.
+
+```{r plot-trimmed-review}
+p_trim <- hobo_slug %>%
+  ggplot(aes(x = time_since_release_s / 60, y = spc_uscm)) +
+  geom_line(linewidth = 0.3) +
+  geom_hline(aes(yintercept = background_spc_probe),
+             linetype = "dashed", colour = "firebrick") +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "darkgreen") +
+  facet_wrap(~ event_id, scales = "free") +
+  labs(x = "Time since release (min)", y = "SpC (µS/cm)",
+       title = "Trimmed slug windows",
+       subtitle = "Green = release | Red = handheld probe background") +
+  theme_minimal(base_size = 10)
+
+ggplotly(p_trim)
+```
+
+# 11. Export
+
+```{r export-btc}
+dir.create(here("data_derived", "dictionary"), recursive = TRUE, showWarnings = FALSE)
+
+btc_conservative <- hobo_slug %>%
+  left_join(window_flags, by = "event_id") %>%
+  transmute(
+    event_id, stream, date, station, slug_label,
+    datetime, time_since_release_s,
+    full_range_uscm, temp_c, spc_uscm,
+    background_spc_probe,
+    logger_serial, source_file, trimmed_file,
+    flag_no_pre_release, flag_peak_at_edge,
+    flag_truncated_tail, flag_logging_gap, flag_na_present
+  ) %>%
+  arrange(event_id, datetime)
+
+events_hobo <- hobo_slug %>%
+  distinct(event_id, stream, date, station, slug_label,
+           addition_datetime, label,
+           nacl_mass_g, amonium_added_g, phophate_added_g,
+           reach_length_m, reach_mean_width_m,
+           background_spc_probe, logger_serial, source_file) %>%
+  left_join(window_summary %>% select(event_id, n_obs, start, end, duration_min,
+                                      dt_median_s, spc_min, spc_max, t_peak_s),
+            by = "event_id") %>%
+  left_join(window_flags, by = "event_id") %>%
+  arrange(stream, date)
+
+write_csv(btc_conservative, here("data_derived", "btc_conservative.csv"))
+write_csv(events_hobo,      here("data_derived", "events_hobo.csv"))
+saveRDS(btc_conservative,   here("data_derived", "btc_conservative.rds"))
+saveRDS(events_hobo,        here("data_derived", "events_hobo.rds"))
+
+dim(btc_conservative); dim(events_hobo)
+```
+
+```{r export-dictionary}
+dict_btc <- tribble(
+  ~column, ~unit, ~description,
+  "event_id",             "-",     "Unique event key: stream_YYYYMMDD_{slug_label|station|single}. Primary key linking all tables in this project.",
+  "stream",               "-",     "Stream code",
+  "date",                 "-",     "Event date (Brasília time)",
+  "station",              "-",     "upstream / downstream for two-station slugs, NA otherwise",
+  "slug_label",           "-",     "P / N for the split RA 2023-09-06 release, NA otherwise",
+  "datetime",             "-",     "Logger timestamp, America/Sao_Paulo (UTC-3)",
+  "time_since_release_s", "s",     "Elapsed time from the tracer addition anchoring this slug",
+  "full_range_uscm",      "uS/cm", "Uncompensated full-range conductivity as logged",
+  "temp_c",               "degC",  "Water temperature",
+  "spc_uscm",             "uS/cm", "Specific conductance, recalculated as full_range / (1 + 0.02*(temp_c - 25))",
+  "background_spc_probe", "uS/cm", "Pre-release SpC from the handheld probe; independent reference, not a logger value",
+  "logger_serial",        "-",     "HOBO logger serial number",
+  "source_file",          "-",     "Raw .xlsx export the observation came from",
+  "trimmed_file",         "-",     "Trimmed CSV written by the Shiny selection app",
+  "flag_no_pre_release",  "-",     "TRUE if the window contains no observation before the release",
+  "flag_peak_at_edge",    "-",     "TRUE if the SpC peak falls in the outer 10% of the window",
+  "flag_truncated_tail",  "-",     "TRUE if SpC at the end of the window is still >15% above the window minimum",
+  "flag_logging_gap",     "-",     "TRUE if the largest inter-record gap exceeds 5x the median logging interval",
+  "flag_na_present",      "-",     "TRUE if any SpC value is missing"
+)
+
+write_csv(dict_btc, here("data_derived", "dictionary", "dict_btc_conservative.csv"))
+dict_btc
+```
+
+```{r session-info}
+sessionInfo()
+```

@@ -1,0 +1,53 @@
+column,unit,description
+event_id,-,Event key; joins btc_conservative and btc_nutrients
+stream,-,Stream code
+date,-,Event date (Brasília time)
+station,-,"upstream/downstream for paired events, NA otherwise"
+slug_label,-,"P/N for the split RA 2023-09-06 release, NA otherwise"
+addition_datetime,-,"Tracer release time, America/Sao_Paulo"
+nacl_mass_g,g,NaCl mass added
+amonium_added_g,g,Ammonium mass added
+phophate_added_g,g,Phosphate mass added
+reach_length_m,m,"Reach length, authoritative survey value"
+reach_mean_width_m,m,"Mean wetted width, authoritative survey value"
+discharge_Ls,L/s,Adopted event discharge; source given by discharge_source
+discharge_source,-,logger / probe / manual_excel; NA when none is valid
+discharge_method,-,Method behind the adopted value
+reason_discharge,-,"Why the logger was not used, where it was not"
+water_velocity_ms,m/s,reach_length / travel time of the adopted source
+stream_depth_m,m,"Mean depth from continuity, adopted discharge and velocity"
+discharge_Ls_logger,L/s,"Discharge from the logger BTC (drifting baseline, trapezoidal, true peak)"
+water_velocity_ms_logger,m/s,"Mean velocity, logger estimate"
+stream_depth_m_logger,m,"Mean depth, logger estimate"
+discharge_Ls_probe,L/s,"Discharge from the handheld BTC (trapezoidal, end-of-rising)"
+water_velocity_ms_probe,m/s,"Mean velocity, handheld estimate"
+stream_depth_m_probe,m,"Mean depth, handheld estimate"
+discharge_Ls_manual,L/s,"Manual Excel value (fixed background, negatives retained)"
+discharge_ratio,-,discharge_Ls_logger / discharge_Ls_probe; cross-check
+t_peak_s_logger,s,"Time to the true SpC peak, logger"
+t_peak_s_probe,s,"End of the rising limb, handheld"
+t_peak_s_hobo_window,s,Time to the SpC peak within the trimmed logger window (01 QAQC diagnostic); distinct from t_peak_s_logger/_probe used for the adopted water_velocity_ms
+max_gap_s,s,Longest interval between consecutive grabs
+frac_area_max_gap,-,Share of the handheld trapezoidal area held by that single interval
+truncated_tail,-,TRUE if the logger was pulled before full baseline return
+flag_discharge_alt,-,TRUE when the adopted value does not come from the logger
+flag_discharge_invalid,-,TRUE when no valid discharge estimate exists
+flag_mixing_incomplete,-,"TRUE when the sensor sampled the plume core, not a mixed section"
+flag_no_baseline,-,TRUE when the window carries no clean pre-release baseline
+flag_weak_signal,-,TRUE when the adopted trapezoidal estimate's peak is only marginally above background noise (RA_20230906_P: ~3%)
+flag_sparse_recession,-,TRUE when one unsampled interval holds >30% of the handheld area
+ph,-,Downstream water pH (event constant)
+temp_c,degC,Downstream water temperature (event constant)
+ca_mgL_up,mg/L,"Calcium upstream, synoptic sample on arrival"
+ca_mgL_down,mg/L,"Calcium downstream, synoptic sample on arrival"
+mg_mgL,mg/L,Magnesium
+na_mgL,mg/L,Sodium
+k_mgL,mg/L,Potassium
+so42_mgL,mg/L,Sulphate
+cl_mgL,mg/L,Chloride
+nh4_background_ugL,ug/L,Ambient NH4-N before release
+srp_background_ugL,ug/L,Ambient SRP before release
+n_grabs_nh4,-,Number of NH4-N grabs
+n_grabs_srp,-,Number of SRP grabs
+has_logger,-,TRUE if a conservative logger series exists
+has_nutrients,-,TRUE if nutrient grabs exist

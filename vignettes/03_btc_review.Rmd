@@ -1,0 +1,368 @@
+---
+title: "03 — Breakthrough curve review and hysteresis"
+subtitle: "Visual QAQC of the final tables, and event-scale hysteresis"
+author: "Kauan Fonseca"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: hide
+    theme: flatly
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.width = 10, fig.height = 7
+)
+
+library(readr)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(stringr)
+library(ggplot2)
+library(plotly)
+library(here)
+```
+
+# Scope
+
+This document does **no processing**: it reads the three derived tables
+written by `02_integration.Rmd` and renders them. If a curve looks wrong
+here, the fix belongs in `02`, never in `03`. It is the final visual
+sanity check before the tables are used for inverse modelling, and it
+reports the nutrient-tracer hysteresis, which is a result rather than a
+QAQC step.
+
+```{r read-tables}
+btc_conservative <- read_rds(here("data_derived", "btc_conservative.rds"))
+btc_nutrients    <- read_rds(here("data_derived", "btc_nutrients.rds"))
+events           <- read_rds(here("data_derived", "events.rds"))
+
+nrow(btc_conservative); nrow(btc_nutrients); nrow(events)
+```
+
+---
+
+# 1. The four curves per event
+
+For every event this overlays, against time since release: the logger
+SpC, the logger-derived NaCl, and the two nutrients (NH4-N, SRP). SpC and
+NaCl are the high-resolution logger series; the nutrients are grab
+samples. Each panel is one event; the y-axes are free because the four
+quantities span different ranges.
+
+```{r long-for-plot}
+cons_long <- btc_conservative %>%
+  transmute(event_id, time_min = time_since_release_s / 60,
+            SpC = spc_uscm, NaCl = nacl_mgL) %>%
+  pivot_longer(c(SpC, NaCl), names_to = "series", values_to = "value") %>%
+  mutate(kind = "logger", variant = "background-corrected")
+
+# Two variants of the same series: the background-corrected concentration
+# (all solutes) and, for SRP only, the same value plus the House (1990)
+# co-precipitation correction (Section 9.5/9.8 of `02`). Both are kept in
+# the SRP facet, distinguished by colour, so the size of the correction is
+# visible directly on the breakthrough curve rather than only in the
+# parity plot of Section 1.1.
+nut_long <- bind_rows(
+  btc_nutrients %>%
+    transmute(event_id, time_min = time_since_release_s / 60,
+              series = solute, value = conc_corr_ugL, kind = "grab",
+              variant = "background-corrected"),
+  btc_nutrients %>%
+    filter(solute == "SRP", !is.na(conc_corr_coprec_ugL)) %>%
+    transmute(event_id, time_min = time_since_release_s / 60,
+              series = solute, value = conc_corr_coprec_ugL, kind = "grab",
+              variant = "+ coprecipitation")
+) %>%
+  filter(!is.na(value))
+
+curves <- bind_rows(cons_long, nut_long) %>%
+  mutate(series = factor(series, levels = c("SpC", "NaCl", "NH4-N", "SRP")))
+```
+
+```{r plot-per-event, fig.height=4}
+# one interactive figure per event; each variable on its own facet row so
+# the different units stay readable
+make_event_plot <- function(ev) {
+  d        <- curves %>% filter(event_id == ev)
+  d_logger <- d %>% filter(kind == "logger")
+  d_grab   <- d %>% filter(kind == "grab")
+
+  # geom_vline(xintercept = 0) is an infinite-extent geom with no data rows
+  # of its own; ggplotly's conversion does not carry it across (silently
+  # drops it), so it is replaced with a geom_segment anchored to each
+  # facet's own y-range (scales are free_y, so a single -Inf/Inf pair would
+  # not clip correctly per panel).
+  vline_df <- d %>%
+    group_by(series) %>%
+    summarise(y_min = min(value, na.rm = TRUE),
+              y_max = max(value, na.rm = TRUE), .groups = "drop")
+
+  # background reference per panel: the pre-release/pre-addition level each
+  # series is judged against. SpC's is the handheld-probe reading at release
+  # (background_spc_probe, 01); NH4-N/SRP are the pre-addition grab
+  # background computed in 02 (nh4_background_ugL / srp_background_ugL).
+  # NaCl has none plotted — it is already background-corrected in 02, so its
+  # own baseline is 0 by construction, not a separate reference value.
+  ev_row <- events %>% filter(event_id == ev)
+  bg_df <- tibble(
+    series     = factor(c("SpC", "NH4-N", "SRP"), levels = levels(d$series)),
+    background = c(ev_row$background_spc_probe, ev_row$nh4_background_ugL,
+                   ev_row$srp_background_ugL)
+  ) %>%
+    filter(!is.na(background))
+
+  p <- ggplot(d, aes(time_min, value)) +
+    geom_segment(data = vline_df,
+                 aes(x = 0, xend = 0, y = y_min, yend = y_max),
+                 inherit.aes = FALSE, linetype = "dashed", colour = "darkgreen")
+
+  if (nrow(bg_df) > 0) {
+    p <- p + geom_hline(data = bg_df, aes(yintercept = background),
+                        inherit.aes = FALSE, linetype = "dotted",
+                        colour = "steelblue", linewidth = 0.4)
+  }
+
+  # the logger (SpC/NaCl) layer is added only when this event actually has
+  # logger rows: SR has no logger at all (see readme.docx field note), so
+  # d_logger is zero-row for SR_20231011_single, and geom_line() on an
+  # empty data frame crashes plotly's to_basic.GeomLine() during ggplotly()
+  # conversion (Error in order(): argument 1 is not a vector).
+  if (nrow(d_logger) > 0) {
+    p <- p + geom_line(data = d_logger, linewidth = 0.3)
+  }
+
+  # grabs are sparse (NH4-N/SRP), so a connecting line makes the shape of
+  # the curve readable between points, not just the isolated values. Guarded
+  # the same way as the logger layer above: events with has_nutrients ==
+  # FALSE (e.g. SA_20231010, RA_20231005_upstream) have zero grab rows, and
+  # geom_line()/geom_point() on empty data crashes ggplotly() conversion.
+  if (nrow(d_grab) > 0) {
+    p <- p +
+      geom_line(data = d_grab, aes(colour = variant), linewidth = 0.3) +
+      geom_point(data = d_grab, aes(colour = variant), size = 1) +
+      scale_colour_manual(values = c("background-corrected" = "firebrick",
+                                     "+ coprecipitation"     = "darkorange"),
+                          name = NULL)
+  }
+
+  p <- p +
+    facet_wrap(~ series, scales = "free_y", ncol = 1, strip.position = "left") +
+    labs(x = "Time since release (min)", y = NULL, title = ev,
+         caption = "Dotted blue = pre-release/pre-addition background") +
+    theme_minimal(base_size = 9) +
+    theme(strip.placement = "outside", legend.position = "bottom")
+
+  ggplotly(p, height = 520)
+}
+
+event_ids <- events %>% filter(has_nutrients | has_logger) %>% pull(event_id) %>% sort()
+```
+
+```{r render-event-plots, results='asis'}
+# htmltools stitches the per-event widgets into the document
+htmltools::tagList(lapply(event_ids, make_event_plot))
+```
+
+## 1.1 Corrected vs uncorrected SRP
+
+`conc_corr_ugL` is SRP after background subtraction only.
+`conc_corr_coprec_ugL` adds back the House (1990) co-precipitated
+fraction (`p_coprec_ugL`), reconstructing what SRP would have been
+without abiotic removal to CaCO₃. If the two series diverge visibly, the
+correction is doing real work; if they overlay, it is not — either
+because too little calcite is forming to matter for that event, or
+because the correction itself is negligible at these activities.
+
+```{r srp-corrected-parity}
+srp_pts <- btc_nutrients %>%
+  filter(solute == "SRP", !is.na(conc_corr_ugL), !is.na(conc_corr_coprec_ugL))
+
+ggplotly(
+  ggplot(srp_pts, aes(conc_corr_ugL, conc_corr_coprec_ugL, colour = event_id)) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey50") +
+    geom_point(size = 1.2, alpha = 0.7) +
+    labs(x = "SRP, background-corrected (µg/L)",
+         y = "SRP, + co-precipitation correction (µg/L)",
+         title = "Every point on the 1:1 line means the coprec correction changed nothing there") +
+    theme_minimal(base_size = 9)
+)
+```
+
+```{r srp-corrected-magnitude}
+srp_pts %>%
+  group_by(event_id) %>%
+  summarise(
+    n = n(),
+    p_coprec_median_ugL = median(p_coprec_ugL, na.rm = TRUE),
+    frac_of_srp_median  = median(p_coprec_ugL / conc_corr_ugL, na.rm = TRUE),
+    delta_ca_mgL        = first(delta_ca_mgL),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(frac_of_srp_median))
+```
+
+> **QAQC note.** `frac_of_srp_median` is of order 1e-8 to 1e-10 for
+> every event in this dataset — the correction moves SRP by a fraction
+> of a part-per-billion of itself, not a visible amount, regardless of
+> how much calcium is being lost (`delta_ca_mgL`, 0.3-0.4 mg/L for most
+> events, comparable across the board). Concretely: this rules out
+> co-precipitation as the explanation for why `RA_20231005_downstream`'s
+> SRP series looks noisier than `RA_20230906_P`'s (Section 1) — the
+> predicted correction for both is of the same tiny order, so it cannot
+> be what separates a coherent curve from an erratic one. That said, a
+> correction this uniformly small, for the one process this manuscript
+> is built to quantify, is itself worth checking against the House
+> (1986/1990) source: `a_PO4`/`a_HPO4` come from PHREEQC (`R/phreeqc_speciation.R`)
+> and are extremely small on their own (~1e-14 to 1e-9), which is
+> plausible for PO₄³⁻ activity at this pH and total-P, but the Langmuir
+> constants `k1_langmuir`/`k2_langmuir` (from `A1`, `E1`, `A2`, `E2` in
+> `coprec-constants`) were not re-derived here and are not verified
+> against the source units. This is flagged, not corrected — changing
+> those constants is not a call to make without the original paper in
+> hand.
+
+# 2. Nutrient vs conservative tracer, overlaid
+
+A more compact view: nutrients and NaCl on the same normalised axis, so
+the timing of the nutrient relative to the conservative tracer is visible
+directly. A nutrient that peaks later or lower than NaCl is being
+retained; one that tracks NaCl is behaving conservatively.
+
+```{r overlay-normalised}
+rescale01 <- function(x) {
+  r <- diff(range(x, na.rm = TRUE))
+  if (!is.finite(r) || r == 0) return(rep(NA_real_, length(x)))
+  (x - min(x, na.rm = TRUE)) / r
+}
+
+overlay <- btc_nutrients %>%
+  filter(!is.na(conc_corr_ugL), !is.na(nacl_mgL)) %>%
+  group_by(event_id, solute) %>%
+  mutate(nutrient_norm = rescale01(conc_corr_ugL),
+         nacl_norm     = rescale01(nacl_mgL),
+         time_min      = time_since_release_s / 60) %>%
+  ungroup()
+
+p_overlay <- overlay %>%
+  pivot_longer(c(nutrient_norm, nacl_norm),
+               names_to = "series", values_to = "value") %>%
+  mutate(series = recode(series, nutrient_norm = "nutrient", nacl_norm = "NaCl")) %>%
+  ggplot(aes(time_min, value, colour = series)) +
+  geom_line(linewidth = 0.3) +
+  geom_point(size = 0.8) +
+  facet_wrap(event_id ~ solute, scales = "free_x") +
+  labs(x = "Time since release (min)", y = "Normalised (0–1)",
+       colour = NULL) +
+  theme_minimal(base_size = 8)
+
+ggplotly(p_overlay)
+```
+
+# 3. Hysteresis of the nutrient breakthrough curves
+
+Following the normalised-loop approach of Lloyd et al. (2016b), adapted
+to a slug-addition setting in which the conservative tracer replaces
+discharge on the x-axis. Both variables are min–max normalised within
+each event and the vertical separation between the rising and falling
+limbs is evaluated at equally spaced tracer levels, restricted to the
+range covered by both limbs. Positive values are clockwise loops
+(nutrient leads the tracer); negative are anticlockwise (nutrient lags —
+the signature of exchange with the transient storage zone).
+
+```{r hysteresis-fn}
+hysteresis_index <- function(df, n_levels = 9, min_overlap = 0.2) {
+  rise <- df %>% filter(curve_limb == "rising")  %>% arrange(x_norm)
+  fall <- df %>% filter(curve_limb == "falling") %>% arrange(x_norm)
+  if (nrow(rise) < 3 || nrow(fall) < 3)
+    return(tibble(level = NA_real_, hi = NA_real_, overlap = NA_real_))
+  lo <- max(min(rise$x_norm), min(fall$x_norm))
+  up <- min(max(rise$x_norm), max(fall$x_norm))
+  if (!is.finite(lo) || !is.finite(up) || (up - lo) < min_overlap)
+    return(tibble(level = NA_real_, hi = NA_real_, overlap = up - lo))
+  lv <- seq(lo, up, length.out = n_levels)
+  tibble(level = lv,
+         hi = approx(rise$x_norm, rise$y_norm, xout = lv, ties = mean)$y -
+              approx(fall$x_norm, fall$y_norm, xout = lv, ties = mean)$y,
+         overlap = up - lo)
+}
+```
+
+```{r hysteresis}
+hyst_input <- btc_nutrients %>%
+  filter(!is.na(nacl_mgL), !is.na(conc_corr_ugL),
+         curve_limb %in% c("rising", "falling")) %>%
+  group_by(event_id, solute) %>%
+  mutate(x_norm = rescale01(nacl_mgL),
+         y_norm = rescale01(conc_corr_ugL)) %>%
+  ungroup()
+
+hyst <- hyst_input %>%
+  group_by(event_id, solute) %>%
+  group_modify(~ hysteresis_index(.x)) %>%
+  ungroup()
+
+hyst_summary <- hyst %>%
+  group_by(event_id, solute) %>%
+  summarise(
+    n_levels     = sum(!is.na(hi)),
+    limb_overlap = first(overlap),
+    HI_mean      = if (any(!is.na(hi))) mean(hi, na.rm = TRUE) else NA_real_,
+    HI_max       = if (any(!is.na(hi))) hi[which.max(abs(replace_na(hi, 0)))] else NA_real_,
+    .groups = "drop"
+  ) %>%
+  arrange(desc(abs(HI_mean)))
+
+hyst_summary
+```
+
+```{r hysteresis-loops}
+ggplotly(
+  btc_nutrients %>%
+    filter(!is.na(nacl_mgL), !is.na(conc_corr_ugL)) %>%
+    arrange(event_id, solute, time_since_release_s) %>%
+    ggplot(aes(nacl_mgL, conc_corr_ugL, colour = curve_limb)) +
+    geom_path(colour = "grey70", linewidth = 0.3) +
+    geom_point(size = 1.2) +
+    facet_wrap(event_id ~ solute, scales = "free") +
+    labs(x = "NaCl (mg/L)", y = "Background-corrected nutrient (µg/L)") +
+    theme_minimal(base_size = 8)
+)
+```
+
+```{r export-hysteresis}
+write_csv(hyst,         here("data_derived", "hysteresis_levels.csv"))
+write_csv(hyst_summary, here("data_derived", "hysteresis_summary.csv"))
+```
+
+> **Note.** `limb_overlap` is a quality field: an index over 25 % of the
+> tracer range is not comparable to one over 80 %, and events below
+> `min_overlap = 0.2` return NA rather than a number built on
+> extrapolation. CC 2023-10-06 and RC 2023-10-07 fall out here — their
+> rising limbs were sampled only near the base of the curve — and are
+> reported as NA.
+
+# 4. Discharge cross-check
+
+```{r discharge-check}
+events %>%
+  filter(!is.na(discharge_ratio)) %>%
+  ggplot(aes(reorder(event_id, discharge_ratio), discharge_ratio)) +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  geom_col(fill = "steelblue", alpha = 0.7) +
+  coord_flip() +
+  labs(x = NULL, y = "Discharge ratio (logger / probe)") +
+  theme_minimal(base_size = 10)
+```
+
+```{r session-info}
+sessionInfo()
+```

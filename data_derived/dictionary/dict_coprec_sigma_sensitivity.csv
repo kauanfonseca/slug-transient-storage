@@ -1,0 +1,5 @@
+column,unit,description
+sigma_label,-,"field_low (adopted, River Frome) / field_high (Waterston aquifer) / lab_ceiling (synthetic solution)"
+sigma_molm2,mol/m2,"SIGMA_P value used for this row, from SIGMA_SENS"
+p_coprec_ugL_sens,ug/L,p_coprec_ugL rescaled to sigma_molm2; linear rescaling of the SIGMA_P-based value
+frac_of_srp_sens,-,"p_coprec_ugL_sens / conc_corr_ugL, at this sigma"

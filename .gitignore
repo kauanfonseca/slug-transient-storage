@@ -1,0 +1,17 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+.DS_Store
+
+# superseded code kept locally for provenance only
+archive/
+
+# raw logger binaries live in the data repository, not in git
+*.hobo
+*.hproj
+*.hlog
+
+# large / transient
+*.rds
+~$*

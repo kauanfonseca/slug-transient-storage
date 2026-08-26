@@ -1,0 +1,9 @@
+column,unit,description
+has_logger,-,TRUE if a conservative tracer series exists for this event
+has_nutrients,-,TRUE if nutrient grab samples exist for this event
+HI_mean_NH4.N,-,Mean normalised hysteresis index for NH4-N; positive = clockwise loop
+HI_max_NH4.N,-,"Hysteresis index at the level of maximum absolute separation, NH4-N"
+limb_overlap_NH4.N,-,Fraction of the normalised tracer range covered by both limbs; index is NA below 0.2
+HI_mean_SRP,-,Mean normalised hysteresis index for SRP
+HI_max_SRP,-,"Hysteresis index at the level of maximum absolute separation, SRP"
+limb_overlap_SRP,-,"Fraction of the normalised tracer range covered by both limbs, SRP"

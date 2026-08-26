@@ -1,0 +1,20 @@
+column,unit,description
+ca_mean_mgL,mg/L,Mean of ca_mgL_up and ca_mgL_down; reference level for the relative-uncertainty propagation
+ca_delta_sd,mg/L,sqrt(2)*CA_RSD*ca_mean_mgL; propagated SD of ca_mass_trans_mgL from two independent EDTA titrations
+ca_delta_z,-,ca_mass_trans_mgL / ca_delta_sd
+flag_ca_resolved,-,"TRUE when |ca_delta_z| > 1, i.e. the observed calcium change exceeds one analytical standard deviation"
+ca_loss_mgL,mg/L,"-ca_mass_trans_mgL; positive = calcium lost (House convention, matches Section 9.4)"
+v_btc_ms,m/s,"water_velocity_ms from events, single (non-split) BTC event on that stream-date only"
+z_btc_m,m,"stream_depth_m from events, same restriction as v_btc_ms"
+mean_width_m,m,"Fixed per-stream reach width, data/field/streams_width.csv; no entry for RC"
+Q_calcium_Ls,L/s,"Discharge assigned to this calcium sampling, discharge_for_calcium.csv (probe/handheld scheme)"
+r_areal_btc_mgm2s,mg m-2 s-1,"Areal calcium rate, route 1 (BTC v, z); NA where v_btc_ms/z_btc_m undefined"
+r_areal_campaign_mgm2s,mg m-2 s-1,"Areal calcium rate, route 2 (campaign Q); NA where width or Q undefined"
+r_areal_campaign_mgm2d,mg m-2 d-1,r_areal_campaign_mgm2s * 86400; reporting convenience only
+r_areal_Qmin_mgm2s,mg m-2 s-1,Route 2 at Q_min_ponto (lowest discharge on record at that site)
+r_areal_Qmax_mgm2s,mg m-2 s-1,Route 2 at Q_max_ponto (highest discharge on record at that site)
+r_areal_Qalt_mgm2s,mg m-2 s-1,Route 2 at Q_alt; only defined for RA 2023-08-04 (alternative 12 kg mass reading)
+route_disagreement_pct,%,"100*(r_areal_btc - r_areal_campaign)/r_areal_campaign; large values flag hydraulic, not chemical, disagreement"
+flag_no_width,-,TRUE when streams_width.csv has no entry for this stream (currently RC)
+flag_no_btc_v,-,TRUE when no single BTC event exists for this stream-date (split events or no logger event that day)
+flag_no_q,-,TRUE when discharge_for_calcium.csv carries no usable Q for this date

@@ -1,0 +1,2058 @@
+---
+title: "02 — Integration and hydraulic characterisation"
+subtitle: "Nutrient grab samples, conservative tracer, and event-level hydraulics"
+author: "Kauan Fonseca"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+    theme: flatly
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.width = 10, fig.height = 6
+)
+
+library(readr)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(stringr)
+library(tibble)
+library(lubridate)
+library(ggplot2)
+library(plotly)
+library(pracma)
+library(here)
+```
+
+```{r constants}
+# mg/L NaCl per uS/cm of background-corrected SpC; laboratory calibration.
+NACL_SLOPE <- 0.461159
+```
+
+# Scope
+
+Takes the instrument-clean logger series from `01_hobo_qaqc.Rmd` and the
+revised nutrient grab samples, and builds the analysis-ready tables that
+feed the inverse transient-storage and nutrient-uptake modelling.
+
+Covers: timestamp reconstruction of the grab samples, harmonisation to
+long format, a time-varying baseline for NaCl, pairing of each grab to
+the interpolated logger series, probe-vs-logger reconciliation,
+event-level hydraulics, and the CaCO₃ co-precipitation correction for
+SRP.
+
+Hysteresis and the final BTC review live in `03_btc_review.Rmd`.
+
+**Outputs:** `data_derived/btc_nutrients.csv`,
+`data_derived/btc_conservative.csv`, `data_derived/events.csv`,
+`data_derived/geochem_check.csv`.
+
+```{r read-01}
+btc_conservative <- read_rds(here("data_derived", "btc_conservative.rds"))
+events_hobo      <- read_rds(here("data_derived", "events_hobo.rds"))
+
+# RA 2023-09-06 N slug used 6240 g NaCl, not the 5957 g inherited from the
+# combined field-sheet row.
+events_hobo <- events_hobo %>%
+  mutate(nacl_mass_g = if_else(event_id == "RA_20230906_N", 6240, nacl_mass_g))
+
+btc_conservative %>% distinct(event_id, stream, date, station, slug_label)
+```
+
+```{r flag-drop}
+btc_conservative <- btc_conservative %>%
+  group_by(event_id) %>%
+  mutate(
+    baseline_ref = {
+      pre <- spc_uscm[time_since_release_s < 0 &
+                      spc_uscm > 0.5 * median(spc_uscm, na.rm = TRUE)]
+      if (length(pre) >= 3) median(pre, na.rm = TRUE)
+      else median(spc_uscm, na.rm = TRUE)
+    },
+    out_of_water = !is.na(baseline_ref) & spc_uscm < 0.5 * baseline_ref
+  ) %>%
+  ungroup()
+
+btc_conservative %>%
+  filter(out_of_water) %>%
+  group_by(event_id) %>%
+  summarise(n_flagged = n(), spc_min = min(spc_uscm),
+            all_pre = all(time_since_release_s < 0), .groups = "drop")
+
+btc_conservative <- btc_conservative %>%
+  filter(!out_of_water) %>%
+  select(-baseline_ref, -out_of_water)
+
+btc_conservative %>% distinct(event_id) %>% nrow()   # esperado: 13 (11 + SR_20231009_downstream + SR_20231009_upstream)
+```
+
+> **QAQC note.** Events whose window opens after the release have no
+> pre-release stretch, so the baseline reference falls back to the event
+> median. Without that fallback the flag is `NA` and the whole event is
+> dropped by the filter. The row count is the guard.
+
+------------------------------------------------------------------------
+
+# 1. Import nutrient grab samples
+
+```{r read-nutrients}
+read_nutrient <- function(path) {
+  read_csv(path, show_col_types = FALSE) %>%
+    mutate(
+      date = ymd(as.character(date)),
+      datetime_field = with_tz(
+        as.POSIXct(paste(date, time_along_btc), tz = "America/Cuiaba"),
+        "America/Sao_Paulo"),
+      release_datetime_field = with_tz(
+        as.POSIXct(paste(date, release_time), tz = "America/Cuiaba"),
+        "America/Sao_Paulo")
+    )
+}
+
+n_raw <- read_nutrient(here("data", "nutrients", "nutrient_addition_nitrogen_data.csv"))
+p_raw <- read_nutrient(here("data", "nutrients", "nutrient_addition_phosphate_data.csv"))
+
+dim(n_raw); dim(p_raw)
+```
+
+```{r diagnose-release-times}
+bind_rows(n_raw %>% mutate(solute = "NH4-N"),
+          p_raw %>% mutate(solute = "SRP")) %>%
+  mutate(diff_s = as.numeric(difftime(datetime_field, release_datetime_field,
+                                      units = "secs")) - time_since_addition_s) %>%
+  count(stream, date, solute, diff_s) %>%
+  arrange(desc(abs(diff_s)))
+```
+
+> **QAQC note.** Three events fail this check. RA 2023-09-06 (SRP) is
+> off by −8100 s because P and N were released sequentially (P at 14:30,
+> N at 16:45) and the phosphate sheet carries the nitrogen release time;
+> the phosphate curve is anchored to 14:30. CB 2023-09-07 (+180 s) and
+> RS/SR 2023-10-11 (+40 s / +10 s) reflect rounding in the field
+> notebook. `time_since_addition_s` is the reliable field, so timestamps
+> are reconstructed as `addition_datetime + time_since_addition_s` and
+> the discrepancy kept in `anchor_drift_s`. This compares two ways of
+> dating a grab within the spreadsheet only; it cannot detect an offset
+> between the field clock and the logger clock.
+
+# 2. Harmonise to long format
+
+N and P at CB 2023-09-07 were added together but sampled alternately, so
+they are distinct samples at distinct times. The two tables are stacked,
+not joined.
+
+```{r harmonise}
+common_cols <- function(df, solute_name, conc, background, conc_corr) {
+  df %>%
+    transmute(stream, date, solute = solute_name,
+              datetime_field, release_datetime_field, time_since_addition_s,
+              sample_btc, curve_limb,
+              conc_ugL = {{ conc }}, background_ugL = {{ background }},
+              conc_corr_ugL = {{ conc_corr }},
+              spc_uscm_grab      = SpC_uScm,
+              spc_corr_uscm_grab = corr_SpC_uScm,
+              nacl_mgL_grab_src  = NaCl_mgL)
+}
+
+nutrients_long <- bind_rows(
+  common_cols(n_raw, "NH4-N", measured_NH4_N_ug_L, nh4_n_ugL_bck, bck_corrected_N_ug_L),
+  common_cols(p_raw, "SRP",   measured_SRP_ug_L,   srp_ugL_bck,   bck_corrected_SRP_ug_L)
+) %>%
+  mutate(nacl_mgL_grab = NACL_SLOPE * pmax(spc_corr_uscm_grab, 0)) %>%
+  arrange(stream, date, solute, time_since_addition_s)
+
+nutrients_long %>% count(stream, date, solute)
+```
+
+> **QAQC note.** `nacl_mgL_grab` is recomputed from the spreadsheet's
+> background-corrected SpC so the same conversion applies to both
+> instruments; the original column is kept as `nacl_mgL_grab_src`. Both
+> rest on a constant background, unlike the logger series of Section 3.
+
+```{r assign-event-id}
+nutrients_long <- nutrients_long %>%
+  mutate(
+    slug_label = case_when(
+      stream == "RA" & date == as.Date("2023-09-06") & solute == "SRP"   ~ "P",
+      stream == "RA" & date == as.Date("2023-09-06") & solute == "NH4-N" ~ "N",
+      TRUE ~ NA_character_),
+    station = if_else(stream == "RA" & date == as.Date("2023-10-05"),
+                      "downstream", NA_character_),
+    event_id = paste(stream, format(date, "%Y%m%d"),
+                     coalesce(slug_label, station, "single"), sep = "_")
+  ) %>%
+  left_join(events_hobo %>% select(event_id, addition_datetime), by = "event_id") %>%
+  mutate(
+    datetime = coalesce(addition_datetime + time_since_addition_s, datetime_field),
+    anchor_drift_s = as.numeric(difftime(datetime_field, datetime, units = "secs"))
+  )
+
+nutrients_long %>%
+  group_by(event_id, solute) %>%
+  summarise(n = n(), t0 = min(datetime), .groups = "drop")
+```
+
+```{r key-reconciliation}
+nutrients_long %>%
+  distinct(event_id) %>% mutate(has_nutrients = TRUE) %>%
+  full_join(btc_conservative %>% distinct(event_id) %>% mutate(has_logger = TRUE),
+            by = "event_id") %>%
+  arrange(event_id)
+```
+
+> **QAQC note.** `SR_20231011_single` has grabs but no logger series:
+> usable for nutrients and for a handheld discharge estimate, not for
+> inverse modelling. `RA_20231005_upstream` has a logger series but no
+> grabs, which is correct — sampling was downstream only.
+
+# 3. NaCl from specific conductance, with a time-varying baseline
+
+Background specific conductance drifts through the experiment with
+temperature and photosynthetic CO₂ drawdown, so a single constant
+baseline drives the tail below zero and corrupts the integral. The
+baseline is modelled as a straight line between the pre-release
+conductance and the conductance at the end of the window, subtracted
+point by point.
+
+The end anchor is valid because the logger was retrieved once SpC had
+returned to its pre-release value. The exception is the events flagged
+`flag_truncated_tail` in `01`, where the logger was pulled before full
+return. For those the end anchor is the lowest point **after the peak**,
+anchored at its own time. Taking the minimum of the whole window and
+pinning it to the end of the window tilts the baseline across the entire
+tail whenever that minimum falls on the rising limb, which is what drove
+CB 2023-10-08 to an implausibly low discharge in earlier versions;
+restricting the search to strictly after the peak is what fixes that.
+
+An earlier version of this fix additionally capped the end anchor so it
+could never sit above the start anchor — treating any post-peak minimum
+higher than the pre-release baseline as suspect. That is too strong: CB
+2023-10-08's background genuinely drifts upward over the event (the
+smoothed post-peak anchor comes out at \~410.7 µS/cm against a
+pre-release baseline of \~409.0, a drift confirmed by the raw record —
+the tail sits on a stable \~410-411 µS/cm plateau, not at 409), and the
+cap discarded that real drift, flattening the correction and inflating
+the tail integral. Removing the cap and letting the post-peak anchor
+stand restores CB 2023-10-08 to \~315 L/s (against the \~317 on record)
+with no change to CD 2023-10-09 (its background never triggered the cap;
+it uses `PRE_STABLE`, not this truncated-tail branch at all) or to CB
+2023-09-07 (its post-peak anchor already sits below the pre-release
+baseline).
+
+The tradeoff is explicit: `RA_20231005_downstream` shares CB
+2023-10-09's pre-tracer instrument step (its start anchor drifts
+continuously from 486 to the low 470s µS/cm over the \~700 s before the
+plateau, unlike CD's single-interval step) and has no `PRE_STABLE`
+window of its own yet (§5.6, not blocking — the event uses the manual
+discharge value). Without the cap its post-peak anchor, computed against
+that unreliable start anchor, produces a nonsensical
+`discharge_Ls_logger` in the diagnostic table. That column was already
+flagged unreliable for this event and is not the adopted value, so this
+is a known caveat made more visible, not a new problem.
+
+```{r drifting-background-fn}
+# Events where the pre-release window does not represent the baseline during
+# tracer passage. CD 2023-10-09 steps down 12 uS/cm in a single 10 s interval
+# at constant temperature, ~160 s after release and well before the tracer
+# arrives: an instrument transition, not water.
+PRE_STABLE <- list(
+  "CD_20231009_single" = c(300, 780)
+  # "RA_20231005_downstream" = c(?, ?)   # same kind of step; window not identified
+)
+
+drifting_background <- function(df, n_anchor = 10, pre_stable_s = NULL) {
+  df <- df %>% arrange(time_since_release_s)
+  truncated <- isTRUE(df$flag_truncated_tail[1])
+
+  pre <- if (!is.null(pre_stable_s)) {
+    df %>% filter(time_since_release_s >= pre_stable_s[1],
+                  time_since_release_s <= pre_stable_s[2])
+  } else {
+    df %>% filter(time_since_release_s < 0)
+  }
+
+  if (nrow(pre) >= 3) {
+    y0 <- median(pre$spc_uscm, na.rm = TRUE)
+    t0 <- max(pre$time_since_release_s)
+  } else {
+    y0 <- median(head(df$spc_uscm, n_anchor), na.rm = TRUE)
+    t0 <- min(df$time_since_release_s)
+  }
+
+  if (truncated) {
+    peak_i <- which.max(df$spc_uscm)
+    post   <- seq_along(df$spc_uscm) > peak_i
+    j <- if (!any(post)) which.min(df$spc_uscm) else which(post)[which.min(df$spc_uscm[post])]
+    k  <- max(1, j - n_anchor %/% 2):min(nrow(df), j + n_anchor %/% 2)
+    y1 <- median(df$spc_uscm[k], na.rm = TRUE)
+    t1 <- median(df$time_since_release_s[k], na.rm = TRUE)
+    # No cap against y0 here (removed): a post-peak anchor above the
+    # pre-release baseline can be a real upward drift (CB 2023-10-08), not
+    # only a mis-identified minimum. The peak-restricted search above is
+    # what guards against the original bug; see the prose note above this
+    # chunk for the CB 2023-10-08 / RA_20231005_downstream tradeoff.
+    anchor_end <- "post_peak_min"
+  } else {
+    tail_df <- tail(df, n_anchor)
+    y1 <- median(tail_df$spc_uscm, na.rm = TRUE)
+    t1 <- median(tail_df$time_since_release_s, na.rm = TRUE)
+    anchor_end <- "tail_return"
+  }
+
+  df$background_drift_uscm <- approx(c(t0, t1), c(y0, y1),
+                                     xout = df$time_since_release_s, rule = 2)$y
+  df$background_anchor_end <- anchor_end
+  df$background_start_src  <- if (is.null(pre_stable_s)) "pre_release" else "stable_window"
+  df
+}
+
+btc_conservative <- btc_conservative %>%
+  select(-any_of(c("background_drift_uscm", "background_anchor_end",
+                   "background_start_src", "spc_corr_uscm", "nacl_mgL"))) %>%
+  group_by(event_id) %>%
+  group_modify(~ drifting_background(.x, pre_stable_s = PRE_STABLE[[.y$event_id]])) %>%
+  ungroup() %>%
+  mutate(
+    spc_corr_uscm = spc_uscm - background_drift_uscm,
+    nacl_mgL      = NACL_SLOPE * pmax(spc_corr_uscm, 0)
+  )
+
+btc_conservative %>% distinct(event_id) %>% nrow()              # esperado: 13 (11 + SR_20231009_downstream + SR_20231009_upstream)
+btc_conservative %>% summarise(min_nacl = min(nacl_mgL, na.rm = TRUE))
+btc_conservative %>% distinct(event_id, background_anchor_end, background_start_src)
+```
+
+```{r drifting-background-check}
+btc_conservative %>%
+  filter(time_since_release_s >= 0) %>%
+  group_by(event_id) %>%
+  summarise(
+    anchor_end = first(background_anchor_end),
+    frac_neg   = mean(spc_corr_uscm < -0.5),
+    frac_zero  = mean(nacl_mgL == 0),
+    drift_uscm = last(background_drift_uscm) - first(background_drift_uscm),
+    integral_nacl = pracma::trapz(time_since_release_s, pmax(spc_corr_uscm, 0)) * NACL_SLOPE,
+    .groups = "drop"
+  ) %>%
+  arrange(desc(frac_neg))
+```
+
+> **QAQC note.** `frac_zero` is the diagnostic that matters for weak
+> events: where the peak is only a few percent above baseline, natural
+> variability is of the same order as the signal in the tail, so
+> flooring removes real curve area and inflates discharge. No baseline
+> fixes this, so those events are handled in Section 6 by declaring a
+> different discharge source rather than by tuning the background.
+
+# 4. Pair each grab to the logger series
+
+```{r pair-function}
+pair_to_logger <- function(grabs, logger, max_gap_s = 60) {
+  grabs %>%
+    group_by(event_id) %>%
+    group_modify(function(g, key) {
+      l <- logger %>% filter(event_id == key$event_id) %>% arrange(datetime)
+      if (nrow(l) < 2)
+        return(mutate(g, spc_uscm_logger = NA_real_,
+                      nacl_mgL_logger = NA_real_, gap_s = NA_real_))
+      tl <- as.numeric(l$datetime); tg <- as.numeric(g$datetime)
+      g$spc_uscm_logger <- approx(tl, l$spc_uscm, xout = tg, rule = 1, ties = mean)$y
+      g$nacl_mgL_logger <- approx(tl, l$nacl_mgL, xout = tg, rule = 1, ties = mean)$y
+      g$gap_s <- vapply(tg, function(t) min(abs(tl - t)), numeric(1))
+      g
+    }) %>%
+    ungroup() %>%
+    mutate(across(c(spc_uscm_logger, nacl_mgL_logger),
+                  ~ if_else(is.na(gap_s) | gap_s > max_gap_s, NA_real_, .x)))
+}
+
+paired <- pair_to_logger(nutrients_long, btc_conservative)
+
+paired %>%
+  group_by(event_id, solute) %>%
+  summarise(n = n(), n_matched = sum(!is.na(nacl_mgL_logger)),
+            gap_median_s = median(gap_s, na.rm = TRUE), .groups = "drop")
+```
+
+```{r nacl-source}
+paired <- paired %>%
+  mutate(
+    nacl_mgL = coalesce(nacl_mgL_logger, nacl_mgL_grab),
+    nacl_source = case_when(
+      !is.na(nacl_mgL_logger) ~ "logger_interpolated",
+      !is.na(nacl_mgL_grab)   ~ "handheld_grab",
+      TRUE                    ~ NA_character_)
+  )
+
+paired %>% count(event_id, nacl_source)
+```
+
+> **QAQC note.** Merging is an added column, not a second table. Both
+> `nacl_mgL_grab` and `nacl_mgL_logger` are kept; `nacl_mgL` carries the
+> value used downstream and `nacl_source` records which one. `gap_s` is
+> interpolation quality, not alignment.
+
+# 5. Probe vs logger reconciliation
+
+```{r offset-regression}
+paired %>%
+  filter(!is.na(spc_uscm_logger)) %>%
+  group_by(event_id) %>% filter(n() >= 4) %>%
+  summarise(n = n(),
+            slope = coef(lm(spc_uscm_grab ~ spc_uscm_logger))[2],
+            r2 = summary(lm(spc_uscm_grab ~ spc_uscm_logger))$r.squared,
+            mean_diff = mean(spc_uscm_grab - spc_uscm_logger),
+            .groups = "drop") %>%
+  arrange(r2)
+```
+
+```{r residual-by-limb}
+resid_limb <- paired %>%
+  filter(!is.na(spc_uscm_logger)) %>%
+  mutate(resid = spc_uscm_grab - spc_uscm_logger,
+         curve_limb = factor(curve_limb, levels = c("rising", "peak", "falling")))
+
+ggplotly(
+  ggplot(resid_limb, aes(curve_limb, resid, fill = curve_limb)) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    geom_boxplot(alpha = 0.6, outlier.size = 0.6) +
+    facet_wrap(~ event_id, scales = "free_y") +
+    labs(x = NULL, y = "Probe − logger (µS/cm)") +
+    theme_minimal(base_size = 9) + theme(legend.position = "none")
+)
+```
+
+> **QAQC note.** The two instruments sat close together at the same
+> station, so no offset correction is warranted. Residuals separate by
+> limb because the tracer cloud is hysteretic: rising and falling limbs
+> carry different concentrations at a given instant, and two sensors a
+> short distance apart sample slightly different points of that field.
+> Tracer dynamics, not a calibration fault. Left uncorrected.
+
+```{r peak-ratio}
+btc_conservative %>%
+  group_by(event_id) %>%
+  summarise(baseline = median(spc_uscm[time_since_release_s < 0], na.rm = TRUE),
+            spc_max = max(spc_uscm, na.rm = TRUE),
+            peak_ratio = spc_max / baseline,
+            .groups = "drop") %>%
+  left_join(events_hobo %>%
+              transmute(event_id, mixing_lengths = reach_length_m / reach_mean_width_m),
+            by = "event_id") %>%
+  arrange(desc(peak_ratio))
+```
+
+> **QAQC note.** Karst events sit at a peak ratio of 1.03–1.29.
+> `RA_20231005_upstream` reaches 3.61: that logger sat close to the
+> release point in a bedrock riffle and the salt had not dispersed
+> across the section, so dilution gauging's premise fails there.
+> `SA_20231010` is high for a benign reason — its baseline is \~4.9
+> µS/cm, so any tracer gives a large ratio. CD 2023-10-09 has only \~5.7
+> mixing lengths against the \~20 usually recommended.
+
+# 6. Event-level hydraulics
+
+Discharge by integral (slug) dilution gauging:
+
+$$ Q = \frac{M}{\displaystyle\int_0^{\infty} C(t)\,dt} $$
+
+For the **logger** the integral is trapezoidal over the high-resolution
+record with the drifting baseline of Section 3, and $t_p$ is the time to
+the true SpC peak. For the **handheld** series the integral is
+trapezoidal over the sparse grabs and $t_p$ the end of the rising limb,
+reproducing the original manual workflow. Velocity is $v = L / t_p$;
+depth follows from continuity, $z = Q / (v\,w)$.
+
+The logger is the default source. Where its integral is invalid for a
+documented physical reason, the value is taken from the handheld series
+or the manual calculation, and the source is recorded per event.
+
+```{r reach-geometry}
+# Authoritative reach geometry, resolved against field survey records.
+reach_geometry <- tribble(
+  ~stream, ~date,                 ~reach_length_m, ~reach_mean_width_m,
+  "CB",    as.Date("2023-09-07"), 162,             7.75,
+  "CB",    as.Date("2023-10-08"), 162,             7.75,
+  "RA",    as.Date("2023-09-06"), 135,             9.46,
+  "RA",    as.Date("2023-10-05"), 135,             9.46,
+  "CD",    as.Date("2023-10-09"),  52,             9.20
+)
+
+# Events with grabs but no logger never enter events_hobo, which is built from
+# the trimmed logger CSVs, so their mass and geometry come from the field sheet.
+# Without this they carry NA mass and no discharge can be computed at all.
+GEOMETRY_NO_LOGGER <- tribble(
+  ~event_id,             ~nacl_mass_g, ~reach_length_m, ~reach_mean_width_m,
+  "SR_20231011_single",  638.9,        72,              1.5
+)
+
+geometry <- events_hobo %>%
+  distinct(event_id, stream, date, nacl_mass_g,
+           reach_length_m, reach_mean_width_m) %>%
+  left_join(reach_geometry, by = c("stream", "date"), suffix = c("", "_auth")) %>%
+  mutate(reach_length_m     = coalesce(reach_length_m_auth, reach_length_m),
+         reach_mean_width_m = coalesce(reach_mean_width_m_auth, reach_mean_width_m)) %>%
+  select(event_id, nacl_mass_g, reach_length_m, reach_mean_width_m) %>%
+  bind_rows(GEOMETRY_NO_LOGGER) %>%
+  distinct(event_id, .keep_all = TRUE)
+
+# guard: nenhum evento com grabs pode ficar sem massa ou geometria
+geometry %>%
+  filter(event_id %in% nutrients_long$event_id) %>%
+  filter(if_any(c(nacl_mass_g, reach_length_m, reach_mean_width_m), is.na))
+```
+
+```{r hydraulics-logger}
+integrate_to_return <- function(t, nacl, spc, return_frac = 0.05) {
+  o <- order(t); t <- t[o]; nacl <- nacl[o]; spc <- spc[o]
+  peak_i <- which.max(spc)
+  peak_nacl <- nacl[peak_i]
+  after <- seq_along(nacl) > peak_i
+  below <- after & nacl < return_frac * peak_nacl
+  end_i <- if (any(below)) which(below)[1] else length(nacl)
+  list(
+    integral = pracma::trapz(t[1:end_i], pmax(nacl[1:end_i], 0)),
+    t_end_s  = t[end_i],
+    t_peak_s = t[peak_i]
+  )
+}
+
+hydro_logger <- btc_conservative %>%
+  filter(time_since_release_s >= 0, !is.na(nacl_mgL)) %>%
+  group_by(event_id) %>%
+  group_modify(function(d, key) {
+    r <- integrate_to_return(d$time_since_release_s, d$nacl_mgL, d$spc_uscm)
+    tibble(integral_Ct_mgLs = r$integral, t_peak_s = r$t_peak_s,
+           t_return_s = r$t_end_s, truncated_tail = first(d$flag_truncated_tail))
+  }) %>%
+  ungroup() %>%
+  left_join(geometry, by = "event_id") %>%
+  mutate(
+    discharge_Ls_logger      = (nacl_mass_g * 1000) / integral_Ct_mgLs,
+    water_velocity_ms_logger = reach_length_m / t_peak_s,
+    stream_depth_m_logger    = (discharge_Ls_logger / 1000) /
+                               (water_velocity_ms_logger * reach_mean_width_m)
+  )
+
+hydro_logger %>%
+  select(event_id, integral_Ct_mgLs, t_peak_s, t_return_s,
+         discharge_Ls_logger, truncated_tail)
+```
+
+```{r hydraulics-probe}
+# Sampling gaps. The handheld integral is trapezoidal, so a long unsampled
+# stretch is filled by a straight line between the bracketing grabs. Where one
+# interval carries a large share of the total area the estimate depends more on
+# that interpolation than on the data, and the flag says so.
+gap_diag <- nutrients_long %>%
+  filter(!is.na(nacl_mgL_grab)) %>%
+  distinct(event_id, time_since_addition_s, nacl_mgL_grab) %>%
+  arrange(event_id, time_since_addition_s) %>%
+  group_by(event_id) %>%
+  mutate(dt = lead(time_since_addition_s) - time_since_addition_s,
+         area_trap = (nacl_mgL_grab + lead(nacl_mgL_grab)) / 2 * dt) %>%
+  summarise(max_gap_s = max(dt, na.rm = TRUE),
+            frac_area_max_gap = max(area_trap, na.rm = TRUE) /
+                                sum(area_trap, na.rm = TRUE),
+            .groups = "drop") %>%
+  mutate(flag_sparse_recession = frac_area_max_gap > 0.3)
+
+hydro_probe <- nutrients_long %>%
+  filter(!is.na(nacl_mgL_grab)) %>%
+  distinct(event_id, time_since_addition_s, curve_limb, nacl_mgL_grab) %>%
+  arrange(event_id, time_since_addition_s) %>%
+  group_by(event_id) %>%
+  summarise(
+    integral_Ct_mgLs = if (n() >= 3 && diff(range(time_since_addition_s)) > 0)
+                         pracma::trapz(time_since_addition_s, pmax(nacl_mgL_grab, 0))
+                       else NA_real_,
+    t_peak_s = if (any(curve_limb == "rising"))
+                 max(time_since_addition_s[curve_limb == "rising"]) else NA_real_,
+    .groups = "drop"
+  ) %>%
+  left_join(geometry, by = "event_id") %>%
+  left_join(gap_diag, by = "event_id") %>%
+  mutate(
+    discharge_Ls_probe      = if_else(is.na(integral_Ct_mgLs) | integral_Ct_mgLs <= 0,
+                                      NA_real_, (nacl_mass_g * 1000) / integral_Ct_mgLs),
+    water_velocity_ms_probe = reach_length_m / t_peak_s,
+    stream_depth_m_probe    = (discharge_Ls_probe / 1000) /
+                              (water_velocity_ms_probe * reach_mean_width_m)
+  )
+
+nutrients_long %>%
+  group_by(event_id) %>%
+  summarise(n_nacl   = sum(!is.na(nacl_mgL_grab)),
+            n_rising = sum(curve_limb == "rising", na.rm = TRUE),
+            t_span_s = diff(range(time_since_addition_s, na.rm = TRUE)),
+            .groups = "drop") %>%
+  arrange(n_nacl)
+
+hydro_probe %>%
+  select(event_id, integral_Ct_mgLs, t_peak_s, discharge_Ls_probe,
+         max_gap_s, frac_area_max_gap, flag_sparse_recession)
+```
+
+> **QAQC note.** `SR_20231011_single` carries the only serious gap: the
+> recession was left unsampled for 1350 s starting 1230 s after the
+> peak, and that single interval holds a large share of the trapezoidal
+> area. Filling it with a left-rectangle rule instead — holding the last
+> concentration flat until the next grab — gives 2.9 L/s rather than
+> 4.4, but a flat plateau followed by an abrupt drop is not how a tracer
+> cloud passes, so the trapezoid is retained. The value is supported
+> independently by the same reach two days earlier, where a logger that
+> ran to full baseline return gave \~4.3 L/s from a different tracer
+> mass.
+
+```{r hydraulics-combine}
+# Discharge source per event. Default is the logger; this table records only
+# the events whose logger integral is invalid, with the reason.
+#   probe  -> handheld trapezoidal estimate
+#   manual -> manual Excel value (fixed background, negatives retained);
+#             no event currently uses this as its adopted source -- kept as
+#             a reference value (discharge_Ls_manual) for every event it was
+#             ever entered for, and as a live fallback if a future logger AND
+#             probe estimate both fail for some event.
+#   none   -> no valid estimate; discharge stays NA
+#
+# RA_20230906_N/_P and RA_20231005_downstream were manual until Kauan's
+# correction: each has a documented physical concern (no pre-release
+# baseline, a peak barely above background, a contaminated start anchor)
+# that argued against trusting an automated trapezoidal estimate there --
+# but that concern is now carried forward as an explicit flag on the
+# adopted probe value (flag_no_baseline, flag_weak_signal below), not as a
+# reason to fall back to a hand-picked number instead. Whether to trust,
+# down-weight, or discard these three in a downstream analysis is a
+# modelling decision made against the flag, not something decided here.
+DISCHARGE_SOURCE_OVERRIDE <- tribble(
+  ~event_id,                ~use_source, ~reason_discharge,
+  "RA_20231005_upstream",   "none",      "incomplete mixing (peak ratio 3.61): dilution gauging premise fails",
+  "RA_20231005_downstream", "probe",     "start anchor contaminated by the pre-tracer step; logger depth physically impossible",
+  "RA_20230906_N",          "probe",     "no pre-release baseline; residual salt from the preceding P slug",
+  "RA_20230906_P",          "probe",     "peak only 3% above baseline; background noise of the same order as the signal",
+  "SR_20231011_single",     "probe",     "no logger series; recession unsampled for 1350 s from 1230 s after the peak"
+)
+
+DISCHARGE_MANUAL <- tribble(
+  ~event_id,                ~discharge_Ls_manual,
+  "RA_20230906_P",          251,
+  "RA_20230906_N",          205,
+  "RA_20231005_downstream", 201,
+  "RA_20231005_upstream",   290
+)
+
+hydraulics <- hydro_logger %>%
+  select(event_id, discharge_Ls_logger, water_velocity_ms_logger,
+         stream_depth_m_logger, t_peak_s_logger = t_peak_s, truncated_tail) %>%
+  full_join(
+    hydro_probe %>%
+      select(event_id, discharge_Ls_probe, water_velocity_ms_probe,
+             stream_depth_m_probe, t_peak_s_probe = t_peak_s,
+             max_gap_s, frac_area_max_gap, flag_sparse_recession),
+    by = "event_id"
+  ) %>%
+  left_join(geometry,                  by = "event_id") %>%
+  left_join(DISCHARGE_SOURCE_OVERRIDE, by = "event_id") %>%
+  left_join(DISCHARGE_MANUAL,          by = "event_id") %>%
+  mutate(
+    use_source      = coalesce(use_source, "logger"),
+    discharge_ratio = discharge_Ls_logger / discharge_Ls_probe,
+
+    discharge_source = case_when(
+      use_source == "none"                                 ~ NA_character_,
+      use_source == "logger" & !is.na(discharge_Ls_logger) ~ "logger",
+      use_source == "probe"  & !is.na(discharge_Ls_probe)  ~ "probe",
+      use_source == "manual" & !is.na(discharge_Ls_manual) ~ "manual_excel",
+      !is.na(discharge_Ls_probe)  ~ "probe",
+      !is.na(discharge_Ls_manual) ~ "manual_excel",
+      !is.na(discharge_Ls_logger) ~ "logger",
+      TRUE ~ NA_character_
+    ),
+
+    discharge_Ls = case_when(
+      discharge_source == "logger"       ~ discharge_Ls_logger,
+      discharge_source == "probe"        ~ discharge_Ls_probe,
+      discharge_source == "manual_excel" ~ discharge_Ls_manual,
+      TRUE ~ NA_real_
+    ),
+
+    t_peak_s = if_else(discharge_source == "logger",
+                       t_peak_s_logger,
+                       coalesce(t_peak_s_probe, t_peak_s_logger)),
+    water_velocity_ms = reach_length_m / t_peak_s,
+    stream_depth_m    = (discharge_Ls / 1000) /
+                        (water_velocity_ms * reach_mean_width_m),
+
+    discharge_method = case_when(
+      discharge_source == "logger"       ~ "logger_trapz_truepeak",
+      discharge_source == "probe"        ~ "probe_trapz_endrising",
+      discharge_source == "manual_excel" ~ "manual_fixed_background",
+      TRUE ~ NA_character_
+    ),
+
+    flag_discharge_alt     = !is.na(discharge_source) & discharge_source != "logger",
+    flag_discharge_invalid = is.na(discharge_Ls),
+    flag_mixing_incomplete = event_id %in% "RA_20231005_upstream",
+    flag_no_baseline       = event_id %in% c("RA_20230906_N", "RA_20231005_downstream"),
+    # RA_20230906_P: probe/logger peak only ~3% above background -- the
+    # trapezoidal integral is adopted (per reason_discharge above) but its
+    # signal-to-noise is low, independent of flag_no_baseline (P has a
+    # clean pre-release baseline; N does not).
+    flag_weak_signal       = event_id %in% "RA_20230906_P",
+    flag_sparse_recession  = coalesce(flag_sparse_recession, FALSE)
+  ) %>%
+  select(-use_source)
+
+hydraulics %>%
+  select(event_id, discharge_Ls, discharge_source, discharge_Ls_logger,
+         discharge_Ls_probe, discharge_Ls_manual, discharge_ratio,
+         water_velocity_ms, stream_depth_m, truncated_tail,
+         flag_discharge_alt, flag_discharge_invalid, flag_no_baseline,
+         flag_weak_signal, flag_sparse_recession) %>%
+  arrange(event_id) %>%
+  print(n = Inf)
+```
+
+```{r hydraulics-logger-vs-probe-plot}
+# Every event with BOTH a logger and a handheld/probe trapezoidal estimate,
+# regardless of which one ended up adopted as discharge_Ls -- so an event
+# where the logger was rejected still shows how far its logger estimate sat
+# from the probe one, and vice versa.
+compare_lp <- hydraulics %>%
+  filter(!is.na(discharge_Ls_logger), !is.na(discharge_Ls_probe))
+
+lp_range <- range(c(compare_lp$discharge_Ls_logger, compare_lp$discharge_Ls_probe))
+
+ggplotly(
+  ggplot(compare_lp, aes(discharge_Ls_logger, discharge_Ls_probe,
+                          color = discharge_source, text = event_id)) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey50") +
+    geom_point(size = 2.5) +
+    scale_x_log10(limits = lp_range) +
+    scale_y_log10(limits = lp_range) +
+    coord_fixed() +
+    labs(x = "Logger discharge (L/s)", y = "Probe discharge (L/s)",
+         color = "Adopted source") +
+    theme_minimal(base_size = 10),
+  tooltip = "text"
+)
+```
+
+> **QAQC note.** `discharge_ratio` (logger / probe) is reported for
+> every event that has both, including those where the logger is not the
+> adopted source, so the disagreement stays visible. Events flagged
+> `truncated_tail` had the logger pulled before full baseline return, so
+> their integral is a lower bound and discharge an upper bound.
+> `RA_20231005_upstream` has no valid discharge: the sensor sampled the
+> plume core rather than a mixed section, so neither dilution gauging
+> nor transient-storage modelling is defensible there, though the curve
+> remains usable for arrival time. The manual values
+> (`discharge_Ls_manual`) are kept in the table as a reference only —
+> they carry the bias of a fixed background with negatives retained, and
+> are not the adopted source for any event as of this revision.
+>
+> **QAQC note — the 1:1 plot above.** Point colour is the *adopted*
+> `discharge_source`, not a judgement about which axis is "right" — a
+> probe-coloured point sitting near the line is not itself evidence the
+> probe is correct there, only that the two independent estimates happen
+> to agree. RA_20230906_N, RA_20230906_P, and RA_20231005_downstream are
+> the three events where the logger was rejected (reasons in
+> `reason_discharge` above) and the probe trapezoidal estimate is now
+> adopted in its place; each carries a flag documenting why the logger
+> reading is not trusted there (`flag_no_baseline` or
+> `flag_weak_signal`) — that flag is not a case against the probe value
+> itself, and no row is excluded on this basis.
+
+## 6.1 SR 2023-10-09: two stations, and a discharge mismatch that turned
+
+out not to be one
+
+The `Q = 4.30 L/s` / 720,452.03 mg/L·s mass-flux integral Kauan first
+gave as a field summary for "the SR slug" turned out, once traced down,
+to be his own manual calculation for the **upstream** station (52 m),
+not the downstream one — its point-by-point NaCl mass-flux column sums
+to 720,452.0299 mg/L·s exactly. Paired against the 72 m downstream
+distance in the original summary table, it looked like a direct
+competing estimate for the same discharge; it is not — it is a different
+station on the same reach. The comparison below is the correct one: both
+stations run through the same pipeline, same `drifting_background()`
+correction, same trapezoidal integral, and — critically — the same
+shared 17:33:10 release anchor recovered in `01` (not each file's own
+inconsistent internal time-since-release column).
+
+```{r sr-two-station}
+hydraulics %>%
+  filter(event_id %in% c("SR_20231009_upstream", "SR_20231009_downstream")) %>%
+  select(event_id, discharge_Ls, water_velocity_ms, t_peak_s, reach_length_m)
+```
+
+> **QAQC note — discharge.** `discharge_Ls_upstream` (4.48 L/s) now
+> lines up with Kauan's own 4.30 L/s manual figure once the same
+> rigorous method is applied on both sides — the earlier apparent
+> mismatch was an artefact of comparing a pipeline-computed downstream
+> value against a manually-computed upstream one and assuming they were
+> for the same point. Downstream discharge (6.13 L/s) exceeding upstream
+> by \~1.65 L/s over the \~20 m between stations reads as a genuine
+> gaining reach: NaCl is conservative and the downstream curve returns
+> fully to baseline (Section 6 above), so the smaller downstream
+> mass-flux integral is not explained by tracer loss. It requires either
+> extra water entering between the stations — diffuse groundwater or
+> hyporheic upwelling is unremarkable in a karst system and would not
+> necessarily show as a visible surface inflow, so this does not require
+> a tributary Kauan would have seen — or a systematic offset between the
+> two logger units (serials `#20835561` vs `#20835564`), which cannot be
+> ruled out without an independent side-by-side calibration check.
+>
+> **QAQC note — velocity.** `water_velocity_ms` does not tell the same
+> clean story: the upstream station, despite being *closer* to the
+> release (52 m vs 72 m), peaks *later* (3110 s vs 2560 s) — 0.0167 m/s
+> against 0.0281 m/s downstream. No reach hydraulics accelerates flow
+> between a slower upstream reading and a faster downstream one along
+> the same channel. The likely explanation is that 52 m is a
+> straight-line/nominal distance, not the true flow-path length to where
+> this logger actually sits: it doubles as the continuous
+> metabolism-monitoring sensor, and those are conventionally sited in a
+> stable pool rather than the channel thalweg, which would both delay
+> and disperse the peak relative to its straight-line distance
+> (consistent with its more attenuated curve — lower peak ratio — than
+> downstream). `water_velocity_ms` and `stream_depth_m` for
+> `SR_20231009_upstream` are flagged unreliable on this basis and should
+> not feed hydraulics-dependent uses (TSM initial parameters, Section
+> 9.7's areal rate); `discharge_Ls`, which depends only on mass and the
+> integral and not on distance, is unaffected and is trusted.
+
+# 7. Event-level attribute table
+
+```{r chemistry}
+chemistry <- p_raw %>%
+  group_by(stream, date) %>%
+  summarise(across(c(ph, temp_c, ca_mgL_up, ca_mgL_down, mg_mgL,
+                     na_mgL, k_mgL, so42_mgL, cl_mgL),
+                   ~ first(na.omit(.x))), .groups = "drop")
+```
+
+```{r build-events}
+event_keys <- bind_rows(
+  events_hobo    %>% distinct(event_id, stream, date, station, slug_label),
+  nutrients_long %>% distinct(event_id, stream, date, station, slug_label)
+) %>% distinct(event_id, .keep_all = TRUE)
+
+events <- event_keys %>%
+  # mass and geometry are dropped here and arrive once, via hydraulics.
+  # t_peak_s is renamed, not dropped: events_hobo's version is the SpC peak
+  # of the trimmed logger window (QAQC diagnostic from 01), a different
+  # quantity from hydraulics' t_peak_s (the travel time behind the adopted
+  # discharge source, used for water_velocity_ms). Left unrenamed, dplyr's
+  # join silently suffixes both .x/.y, which the guard below catches.
+  left_join(
+    events_hobo %>%
+      select(-stream, -date, -station, -slug_label,
+             -any_of(c("nacl_mass_g", "reach_length_m", "reach_mean_width_m"))) %>%
+      rename(t_peak_s_hobo_window = t_peak_s),
+    by = "event_id"
+  ) %>%
+  left_join(chemistry,  by = c("stream", "date")) %>%
+  left_join(hydraulics, by = "event_id") %>%
+  left_join(
+    nutrients_long %>%
+      group_by(event_id) %>%
+      summarise(n_grabs_nh4 = sum(solute == "NH4-N"),
+                n_grabs_srp = sum(solute == "SRP"),
+                nh4_background_ugL = first(na.omit(background_ugL[solute == "NH4-N"])),
+                srp_background_ugL = first(na.omit(background_ugL[solute == "SRP"])),
+                .groups = "drop"),
+    by = "event_id"
+  ) %>%
+  mutate(has_logger    = event_id %in% btc_conservative$event_id,
+         has_nutrients = event_id %in% nutrients_long$event_id) %>%
+  arrange(stream, date)
+
+nrow(events)                                   # esperado: 13 (11 + SR_20231009_downstream + SR_20231009_upstream)
+events %>% count(event_id) %>% filter(n > 1)   # deve ser vazio
+names(events) %>% str_subset("\\.(x|y)$")      # deve ser character(0)
+
+events %>% select(event_id, nacl_mass_g, reach_length_m, reach_mean_width_m,
+                  discharge_Ls, discharge_source, water_velocity_ms,
+                  stream_depth_m, flag_discharge_alt, flag_discharge_invalid,
+                  flag_mixing_incomplete, flag_no_baseline,
+                  flag_sparse_recession, has_logger, has_nutrients) %>%
+  print(n = Inf)
+```
+
+# 8. Export
+
+```{r export}
+btc_nutrients <- paired %>%
+  transmute(event_id, stream, date, station, slug_label, solute,
+            datetime, time_since_release_s = time_since_addition_s,
+            anchor_drift_s, sample_btc, curve_limb,
+            conc_ugL, background_ugL, conc_corr_ugL,
+            spc_uscm_grab, spc_corr_uscm_grab, spc_uscm_logger,
+            nacl_mgL_grab, nacl_mgL_grab_src, nacl_mgL_logger,
+            nacl_mgL, nacl_source, gap_s) %>%
+  arrange(event_id, solute, time_since_release_s)
+
+write_csv(btc_conservative, here("data_derived", "btc_conservative.csv"))
+write_csv(events,           here("data_derived", "events.csv"))
+
+saveRDS(btc_conservative, here("data_derived", "btc_conservative.rds"))
+saveRDS(events,           here("data_derived", "events.rds"))
+
+dim(btc_nutrients); dim(btc_conservative); dim(events)
+```
+
+> **Note.** `btc_nutrients` is written in Section 9, after the
+> co-precipitation columns are added, so the file on disk always carries
+> the complete table.
+
+```{r dictionary}
+dict_events <- tribble(
+  ~column, ~unit, ~description,
+  "event_id",             "-",     "Event key; joins btc_conservative and btc_nutrients",
+  "stream",               "-",     "Stream code",
+  "date",                 "-",     "Event date (Brasília time)",
+  "station",              "-",     "upstream/downstream for paired events, NA otherwise",
+  "slug_label",           "-",     "P/N for the split RA 2023-09-06 release, NA otherwise",
+  "addition_datetime",    "-",     "Tracer release time, America/Sao_Paulo",
+  "nacl_mass_g",          "g",     "NaCl mass added",
+  "amonium_added_g",      "g",     "Ammonium mass added",
+  "phophate_added_g",     "g",     "Phosphate mass added",
+  "reach_length_m",       "m",     "Reach length, authoritative survey value",
+  "reach_mean_width_m",   "m",     "Mean wetted width, authoritative survey value",
+  "discharge_Ls",         "L/s",   "Adopted event discharge; source given by discharge_source",
+  "discharge_source",     "-",     "logger / probe / manual_excel; NA when none is valid",
+  "discharge_method",     "-",     "Method behind the adopted value",
+  "reason_discharge",     "-",     "Why the logger was not used, where it was not",
+  "water_velocity_ms",    "m/s",   "reach_length / travel time of the adopted source",
+  "stream_depth_m",       "m",     "Mean depth from continuity, adopted discharge and velocity",
+  "discharge_Ls_logger",  "L/s",   "Discharge from the logger BTC (drifting baseline, trapezoidal, true peak)",
+  "water_velocity_ms_logger","m/s","Mean velocity, logger estimate",
+  "stream_depth_m_logger","m",     "Mean depth, logger estimate",
+  "discharge_Ls_probe",   "L/s",   "Discharge from the handheld BTC (trapezoidal, end-of-rising)",
+  "water_velocity_ms_probe","m/s", "Mean velocity, handheld estimate",
+  "stream_depth_m_probe", "m",     "Mean depth, handheld estimate",
+  "discharge_Ls_manual",  "L/s",   "Manual Excel value (fixed background, negatives retained)",
+  "discharge_ratio",      "-",     "discharge_Ls_logger / discharge_Ls_probe; cross-check",
+  "t_peak_s_logger",      "s",     "Time to the true SpC peak, logger",
+  "t_peak_s_probe",       "s",     "End of the rising limb, handheld",
+  "t_peak_s_hobo_window", "s",     "Time to the SpC peak within the trimmed logger window (01 QAQC diagnostic); distinct from t_peak_s_logger/_probe used for the adopted water_velocity_ms",
+  "max_gap_s",            "s",     "Longest interval between consecutive grabs",
+  "frac_area_max_gap",    "-",     "Share of the handheld trapezoidal area held by that single interval",
+  "truncated_tail",       "-",     "TRUE if the logger was pulled before full baseline return",
+  "flag_discharge_alt",   "-",     "TRUE when the adopted value does not come from the logger",
+  "flag_discharge_invalid","-",    "TRUE when no valid discharge estimate exists",
+  "flag_mixing_incomplete","-",    "TRUE when the sensor sampled the plume core, not a mixed section",
+  "flag_no_baseline",     "-",     "TRUE when the window carries no clean pre-release baseline",
+  "flag_weak_signal",     "-",     "TRUE when the adopted trapezoidal estimate's peak is only marginally above background noise (RA_20230906_P: ~3%)",
+  "flag_sparse_recession","-",     "TRUE when one unsampled interval holds >30% of the handheld area",
+  "ph",                   "-",     "Downstream water pH (event constant)",
+  "temp_c",               "degC",  "Downstream water temperature (event constant)",
+  "ca_mgL_up",            "mg/L",  "Calcium upstream, synoptic sample on arrival",
+  "ca_mgL_down",          "mg/L",  "Calcium downstream, synoptic sample on arrival",
+  "mg_mgL",               "mg/L",  "Magnesium",
+  "na_mgL",               "mg/L",  "Sodium",
+  "k_mgL",                "mg/L",  "Potassium",
+  "so42_mgL",             "mg/L",  "Sulphate",
+  "cl_mgL",               "mg/L",  "Chloride",
+  "nh4_background_ugL",   "ug/L",  "Ambient NH4-N before release",
+  "srp_background_ugL",   "ug/L",  "Ambient SRP before release",
+  "n_grabs_nh4",          "-",     "Number of NH4-N grabs",
+  "n_grabs_srp",          "-",     "Number of SRP grabs",
+  "has_logger",           "-",     "TRUE if a conservative logger series exists",
+  "has_nutrients",        "-",     "TRUE if nutrient grabs exist"
+)
+
+dict_btc_nutrients <- tribble(
+  ~column, ~unit, ~description,
+  "event_id",             "-",     "Event key",
+  "solute",               "-",     "NH4-N or SRP",
+  "datetime",             "-",     "Reconstructed as addition_datetime + time_since_addition_s",
+  "time_since_release_s", "s",     "Elapsed time from the release anchoring this slug",
+  "anchor_drift_s",       "s",     "Disagreement between spreadsheet clock and reconstructed timestamp",
+  "sample_btc",           "-",     "Sample identifier along the breakthrough curve",
+  "curve_limb",           "-",     "rising / peak / falling",
+  "conc_ugL",             "ug/L",  "Measured nutrient concentration",
+  "background_ugL",       "ug/L",  "Ambient nutrient concentration before release",
+  "conc_corr_ugL",        "ug/L",  "Background-corrected nutrient concentration",
+  "spc_uscm_grab",        "uS/cm", "SpC read with the handheld probe",
+  "spc_corr_uscm_grab",   "uS/cm", "Background-corrected SpC from the spreadsheet (constant background)",
+  "spc_uscm_logger",      "uS/cm", "Logger SpC interpolated at the grab timestamp",
+  "nacl_mgL_grab",        "mg/L",  "NaCl from spc_corr_uscm_grab using NACL_SLOPE",
+  "nacl_mgL_grab_src",    "mg/L",  "NaCl as it appears in the source spreadsheet",
+  "nacl_mgL_logger",      "mg/L",  "Logger NaCl interpolated at the grab timestamp",
+  "nacl_mgL",             "mg/L",  "Value used downstream; logger where available, grab otherwise",
+  "nacl_source",          "-",     "logger_interpolated or handheld_grab",
+  "gap_s",                "s",     "Distance to the nearest logger record; interpolation quality"
+)
+
+write_csv(dict_events, here("data_derived", "dictionary", "dict_events.csv"))
+dict_events
+```
+
+# 9. CaCO₃ co-precipitation correction for SRP
+
+## 9.1 Why the correction is needed
+
+In alkaline karst streams part of the dissolved inorganic phosphorus is
+removed abiotically, adsorbed onto calcite as it precipitates, rather
+than assimilated by organisms. In the breakthrough curve that removal is
+indistinguishable from biological uptake: both make phosphorus disappear
+faster than the conservative tracer. Left uncorrected it inflates every
+phosphorus uptake metric, and the inflation is largest exactly where
+calcite precipitation is strongest — a systematic bias correlated with
+the variable of interest, not noise.
+
+## 9.2 What the correction does
+
+Following House (1986, 1990), the co-precipitated P at each grab is
+
+$$ n_{P,\mathrm{cop}} = \Delta n_{\mathrm{Ca}}\,(\sigma\,N_A\,d)\,h $$
+
+where $\Delta n_{\mathrm{Ca}}$ is the net loss of dissolved Ca²⁺ across
+the reach (mol L⁻¹), $\sigma$ the maximum surface density of P on
+precipitating calcite (5.5 × 10⁻⁷ mol m⁻²), $d$ the molecular surface
+area of calcite (2.01 × 10⁻¹⁹ m² molecule⁻¹), $N_A$ Avogadro's number,
+and $h$ the fraction of dissolved phosphate liable to sorb, from the
+two-component Langmuir model
+
+$$ h = \frac{K_1 a_{\mathrm{PO}_4^{3-}} + K_2 a_{\mathrm{HPO}_4^{2-}}}
+             {1 + K_1 a_{\mathrm{PO}_4^{3-}} + K_2 a_{\mathrm{HPO}_4^{2-}}} $$
+
+with activities from PHREEQC and the adsorption constants
+temperature-dependent through Arrhenius expressions,
+
+$$ K_1(T) = A_1 \exp\!\left(\frac{E_1}{RT}\right), \qquad
+   K_2(T) = A_2 \exp\!\left(\frac{E_2}{RT}\right) $$
+
+where $A_1 = 0.6915$, $A_2 = 4.361 \times 10^{-9}$, $E_1 = 18.2$ kJ
+mol⁻¹, $E_2 = 42.6$ kJ mol⁻¹, $R$ = 8.314 J mol⁻¹ K⁻¹ and $T$ is
+downstream water temperature in kelvin.
+
+**Where each term comes from.** The activities are computed from the
+**downstream** solution — the water passing the sampling station is what
+must be speciated — using downstream pH, temperature and major ions,
+with `ca_mgL_down` rather than any upstream-downstream mean.
+$\Delta n_{\mathrm{Ca}}$ comes from a synoptic pair: upstream and
+downstream calcium sampled on arrival at the reach, before the nutrient
+release. It measures the calcite precipitation the reach was sustaining
+under ambient conditions, so it is one value per event, and the
+within-event variation in $n_{P,\mathrm{cop}}$ comes entirely from $h$,
+which tracks phosphate speciation as the slug passes. This follows from
+the design: a single ambient pair characterises the reach, and the model
+scales it by how much phosphate is present at each instant.
+
+Two consequences are stated rather than worked around. The calcium pair
+predates the release, so it cannot capture any change in calcite
+dynamics caused by the addition itself. And being a single pair, the
+correction carries no within-event uncertainty — its uncertainty is
+entirely between events.
+
+**Data provenance note.** The `ph` and `temp_c` columns of the nutrient
+spreadsheets originally carried the upstream reading for some events, a
+field-sheet transcription error corrected before the speciation was run.
+Since 0.1 pH unit and 1 °C both shift $K_1$, $K_2$ and the PO₄³⁻/HPO₄²⁻
+partition measurably, the guard in `R/phreeqc_speciation.R` re-checks
+every event against the synoptic upstream table and warns if any still
+matches the upstream value exactly.
+
+## 9.3 How it enters the pipeline, and why not as an overwrite
+
+Under TASCC the correction feeds a per-sample regression of
+$S_{w\text{-add}}$ against the geometric mean concentration, so each
+grab yields its own uptake length and a corrected point simply replaces
+an uncorrected one. Under inverse transient-storage modelling the
+corrected series **is** the observation vector: the whole curve is
+fitted at once, and a correction applied unevenly along it changes the
+shape the model is matching, not just the value at a point. Overwriting
+would make the two analyses non-comparable and irreversible.
+
+The correction is therefore added as parallel columns and
+`conc_corr_ugL` is never modified, so both series can be run through the
+inverse model and the difference attributed to the abiotic pathway.
+
+**Naming.** The suffix `_corr` already means "background-corrected"
+throughout this pipeline (`conc_corr_ugL`, `spc_corr_uscm`,
+`spc_corr_uscm_grab`). The co-precipitation column extends that same
+series rather than introducing a second meaning, so it is
+`conc_corr_coprec_ugL`: the background-corrected concentration, plus the
+co-precipitated fraction. It is `NA` for NH4-N, like every other
+SRP-specific column in this long-format table.
+
+## 9.4 Calcium change along the reach
+
+The House model needs to know how much dissolved calcium the reach
+removed from the water. That comes from `calcium_reach_change.csv`: two
+water samples per event, one at the top of the reach and one at the
+bottom, both collected on arrival before anything was released. The same
+sampling gave pH and specific conductance at both ends.
+
+Because the two samples are taken at the same time, the difference
+between them is a difference in space — what the reach did to the water
+passing through it — and not a change over the course of the day. This
+is the file the pipeline uses for calcium, pH and conductance; it
+replaces the values carried in the nutrient spreadsheets so these
+quantities have one source.
+
+The convention in the file is downstream minus upstream, so **negative
+means calcium was lost along the reach**, which is what calcite
+precipitation does. The House model of Section 9.2 wants that loss as a
+positive number, so `delta_ca_mgL` in Section 9.5 is the negation of
+this column.
+
+### The three ratios
+
+Each variable is expressed as a log response ratio: the natural log of
+the downstream value over the upstream value.
+
+$$ \mathrm{LRR}_{X} = \ln\!\frac{X_{\mathrm{down}}}{X_{\mathrm{up}}} $$
+
+Zero means no change, negative means the reach removed it. The log form
+is used because it makes losses and gains symmetric — halving and
+doubling are equal and opposite — and because calcium (tens of mg L⁻¹)
+and conductance (hundreds of µS cm⁻¹) then sit on the same scale.
+
+pH is already a logarithm, so a ratio of pH values means nothing
+physical. The ratio is taken on hydrogen ion activity instead:
+
+$$ \mathrm{LRR}_{\mathrm{H}^+} =
+   -\ln(10)\,\bigl(\mathrm{pH}_{\mathrm{down}} - \mathrm{pH}_{\mathrm{up}}\bigr) $$
+
+Negative means the water alkalinised.
+
+Calcium and conductance together separate two mechanisms. Water entering
+the reach from elsewhere dilutes everything in proportion, moving both
+ratios equally. Only selective removal moves calcium further than
+conductance, so `lrr_ca_excess`, the difference between the two, is the
+part of the calcium change that dilution cannot account for.
+
+```{r coprec-geochem-check}
+reach_pair <- read_csv(here("data", "field", "calcium_reach_change.csv"),
+                       show_col_types = FALSE) %>%
+  mutate(date = ymd(as.character(date))) %>%
+  rename(ph_up = ph_upstream, ph_down = ph_dowstream,
+         spc_uscm_up = spc_upstream, spc_uscm_down = spc_downstream,
+         ca_mgL_up = ca_upstream, ca_mgL_down = ca_downstream)
+
+geochem_check <- reach_pair %>%
+  mutate(
+    # file convention: downstream - upstream, so negative = calcium lost
+    ca_mass_trans_mgL = ca_mgL_down - ca_mgL_up,
+
+    lrr_ca  = log(ca_mgL_down / ca_mgL_up),
+    lrr_spc = log(spc_uscm_down / spc_uscm_up),
+    lrr_h   = -log(10) * (ph_down - ph_up),
+
+    # calcium change beyond what dilution explains
+    lrr_ca_excess = lrr_ca - lrr_spc,
+
+    ca_change_pct = 100 * (exp(lrr_ca) - 1),
+
+    # is this one of the events analysed in this study?
+    in_study = paste(stream, format(date, "%Y%m%d")) %in%
+               paste(events$stream, format(events$date, "%Y%m%d"))
+  ) %>%
+  arrange(stream, date)
+
+geochem_check %>%
+  select(stream, date, in_study, ca_mgL_up, ca_mgL_down, ca_mass_trans_mgL,
+         ca_change_pct, lrr_ca, lrr_spc, lrr_ca_excess, lrr_h) %>%
+  print(n = Inf)
+```
+
+### Per stream
+
+Each stream was sampled on more than one date. Averaging the log ratios
+is the correct way to average ratios — the mean of the logs is the log
+of the geometric mean, whereas averaging percentages is not meaningful.
+
+The spread between dates is reported alongside the mean, because it is
+the more informative number here. Calcium transfer varies within a
+stream, between streams, and from one day to the next, so a stream mean
+is only a useful summary when the dates agree on direction. Where they
+do not, `same_direction` is `FALSE` and the mean should not be read as a
+property of the stream.
+
+```{r coprec-geochem-by-stream}
+geochem_by_stream <- geochem_check %>%
+  group_by(stream) %>%
+  summarise(
+    n_dates = n(),
+    dates   = paste(format(date, "%d/%m"), collapse = ", "),
+
+    ca_delta_mean = mean(ca_mass_trans_mgL),
+    ca_delta_min  = min(ca_mass_trans_mgL),
+    ca_delta_max  = max(ca_mass_trans_mgL),
+
+    lrr_ca_mean = mean(lrr_ca),
+    lrr_ca_sd   = if (n() > 1) sd(lrr_ca) else NA_real_,
+    lrr_ca_excess_mean = mean(lrr_ca_excess, na.rm = TRUE),
+    lrr_h_mean  = mean(lrr_h, na.rm = TRUE),
+
+    same_direction = n_distinct(sign(ca_mass_trans_mgL)) == 1,
+    .groups = "drop"
+  ) %>%
+  mutate(ca_change_pct_mean = 100 * (exp(lrr_ca_mean) - 1)) %>%
+  arrange(lrr_ca_mean)
+
+geochem_by_stream %>% print(n = Inf)
+```
+
+```{r coprec-geochem-plot, fig.height=4.5, fig.width=11}
+ord <- geochem_check %>%
+  mutate(event = paste(stream, format(date, "%d/%m"))) %>%
+  arrange(lrr_ca) %>%
+  pull(event)
+
+geochem_check %>%
+  mutate(event = factor(paste(stream, format(date, "%d/%m")), levels = ord)) %>%
+  select(event, stream, lrr_ca, lrr_spc, lrr_h) %>%
+  pivot_longer(starts_with("lrr_"), names_to = "series", values_to = "lrr") %>%
+  filter(!is.na(lrr)) %>%
+  mutate(series = factor(series,
+    levels = c("lrr_ca", "lrr_spc", "lrr_h"),
+    labels = c("Ca", "SpC", "pH"))) %>%
+  ggplot(aes(lrr, event, colour = stream)) +
+  geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.4) +
+  geom_segment(aes(x = 0, xend = lrr, yend = event), linewidth = 0.5) +
+  geom_point(size = 3) +
+  facet_wrap(~ series, nrow = 1, scales = "free_x") +
+  labs(x = "log response ratio (ln down / up)", y = NULL) +
+  cowplot::theme_cowplot(font_size = 14) +
+  theme(legend.position = "none",
+        panel.grid.major.y = element_line(colour = "grey90", linewidth = 0.3))
+```
+
+> **QAQC note.** Negative calcium change means the reach removed
+> calcium, which precipitation produces; positive means it gained
+> calcium, which precipitation cannot explain. Most events show a small
+> gain, so co-precipitation is not a system-wide process in this
+> dataset: the correction has a material effect only where calcium was
+> clearly removed, and no effect at all where it was gained.
+>
+> Calcium was determined by EDTA titration at a commercial laboratory
+> and reported to 0.1 mg L⁻¹. Several events differ by exactly 0.4 mg
+> L⁻¹, which is close to the reporting precision, so those changes are
+> recorded but carry little weight. The uncertainty is quantified in
+> Section 9.6.
+>
+> `lrr_spc` and `lrr_h` are `NA` where the upstream reading is missing
+> from the file; `lrr_ca` is defined for every event. \`\`\`
+
+## 9.5 Application
+
+```{r coprec-constants}
+# SIGMA_P: House (1990) reports several sigma estimates, and they cluster by
+# solution type rather than scattering randomly -- field/river waters run
+# 0.055-0.095 umol/m2 (River Frome, River Windrush, Waterston chalk
+# aquifer), while idealised synthetic Ca(HCO3)2 solutions run 0.13-0.22
+# umol/m2. This is a karst STREAM, not a synthetic solution, so the field
+# cluster is the physically appropriate class. 5.5e-8 mol/m2 is the River
+# Frome value (House et al. 1986a; the "river water" case House 1990
+# itself highlights) -- the same value and reasoning Cohen et al. (2013,
+# Ecol. Monogr. 83:2) used for the Ichetucknee River, a spring-fed
+# karst/calcite stream directly analogous to this system, explicitly
+# preferring the field value because natural water carries competing
+# solutes (Mg, Fe, DOM) that reduce the effective sorption area, and
+# because their own sensitivity check found the lab-range value inflates
+# the correction ~47x and yields implausible C:P ratios. See Section 9.8
+# for the corresponding sensitivity range in this pipeline.
+SIGMA_P   <- 5.5e-8        # mol/m2 -- River Frome (House 1990 / Cohen et al. 2013)
+D_CALCITE <- 2.01e-19      # m2/molecule, molecular surface area of calcite
+N_AVOG    <- 6.02214076e23 # molecules/mol
+R_GAS     <- 8.314         # J/mol/K
+A1 <- 0.6915  ; E1 <- 18.2e3   # J/mol
+A2 <- 4.361e-9; E2 <- 42.6e3   # J/mol
+
+M_P  <- 30.973762   # g/mol
+M_CA <- 40.078      # g/mol
+
+h_langmuir2 <- function(a_PO4, a_HPO4, K1, K2) {
+  num <- K1 * a_PO4 + K2 * a_HPO4
+  num / (1 + num)
+}
+```
+
+```{r coprec-apply}
+act_path <- here("data_derived", "phreeqc_activities.csv")
+
+if (!file.exists(act_path)) {
+  warning("phreeqc_activities.csv nao encontrado: rode R/phreeqc_speciation.R. ",
+          "As colunas de coprecipitacao ficarao NA.")
+  coprec <- tibble(stream = character(), date = as.Date(character()),
+                   sample_btc = numeric())
+} else {
+  # date is written as a bare integer (20231008) by the speciation script, so
+  # it must be parsed with ymd(); as.Date() on a number silently yields a date
+  # in year 57345 and every join returns NA.
+  coprec <- read_csv(act_path, show_col_types = FALSE) %>%
+    mutate(date = ymd(as.character(date))) %>%
+    left_join(
+      p_raw %>% select(stream, date, sample_btc, temp_c, ca_mgL_up, ca_mgL_down),
+      by = c("stream", "date", "sample_btc")
+    ) %>%
+    mutate(
+      T_K = temp_c + 273.15,
+      k1_langmuir = A1 * exp(E1 / (R_GAS * T_K)),
+      k2_langmuir = A2 * exp(E2 / (R_GAS * T_K)),
+      # House's K1/K2 (Eq. 7-8) and the Langmuir isotherm (Eq. 9, House
+      # 1990) are defined for [PO4^3-]/[HPO4^2-] in umol/dm^3 -- House
+      # states this explicitly under Eq. 8 ("the concentrations of the
+      # phosphate and hydrogenphosphate ions are expressed in units of
+      # umol dm^-3"). PHREEQC's -activities output is on a mol/L numeric
+      # scale, six orders of magnitude smaller; passing it to
+      # h_langmuir2() unconverted collapses h_adsorbed toward ~0
+      # regardless of how saturated the solution actually is -- this is
+      # the second, larger reason the coprecipitation correction still
+      # looked negligible after the SIGMA_P and major-ion mg/L fixes.
+      h_adsorbed  = h_langmuir2(a_PO4 * 1e6, a_HPO4 * 1e6, k1_langmuir, k2_langmuir),
+
+      # synoptic pair on arrival; positive = calcium lost across the reach
+      delta_ca_mgL  = ca_mgL_up - ca_mgL_down,
+      delta_ca_molL = delta_ca_mgL / (1000 * M_CA),
+
+      p_coprec_molL = delta_ca_molL * (SIGMA_P * N_AVOG * D_CALCITE) * h_adsorbed,
+      p_coprec_ugL  = p_coprec_molL * M_P * 1e6,
+
+      flag_delta_ca_neg = delta_ca_mgL < 0
+    ) %>%
+    select(stream, date, sample_btc, a_PO4, a_HPO4, h_adsorbed,
+           k1_langmuir, k2_langmuir, delta_ca_mgL, p_coprec_ugL,
+           flag_delta_ca_neg)
+}
+
+# guard: the join must match. If this returns 0 rows the date types disagree.
+cat("eventos com atividades pareadas:",
+    nrow(distinct(coprec, stream, date)), "\n")
+
+# Adding p_coprec to the background-corrected concentration reconstructs the
+# SRP that would have been present without abiotic removal:
+#   (measured + coprecipitated) - background
+# Background subtraction and this addition commute, so order is immaterial.
+btc_nutrients <- btc_nutrients %>%
+  select(-any_of(c("a_PO4", "a_HPO4", "h_adsorbed", "k1_langmuir",
+                   "k2_langmuir", "delta_ca_mgL", "p_coprec_ugL",
+                   "flag_delta_ca_neg", "conc_corr_coprec_ugL"))) %>%
+  left_join(coprec, by = c("stream", "date", "sample_btc")) %>%
+  mutate(
+    across(c(a_PO4, a_HPO4, h_adsorbed, k1_langmuir, k2_langmuir,
+             delta_ca_mgL, p_coprec_ugL),
+           ~ if_else(solute == "SRP", .x, NA_real_)),
+    flag_delta_ca_neg = if_else(solute == "SRP", flag_delta_ca_neg, NA),
+    conc_corr_coprec_ugL = if_else(solute == "SRP",
+                                   conc_corr_ugL + p_coprec_ugL,
+                                   NA_real_)
+  )
+
+btc_nutrients %>%
+  filter(solute == "SRP") %>%
+  group_by(event_id) %>%
+  summarise(
+    n = n(),
+    delta_ca_mgL = first(delta_ca_mgL),
+    h_median     = median(h_adsorbed, na.rm = TRUE),
+    coprec_median_ugL = median(p_coprec_ugL, na.rm = TRUE),
+    frac_of_srp  = median(p_coprec_ugL / conc_corr_ugL, na.rm = TRUE),
+    delta_ca_neg = first(flag_delta_ca_neg),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(delta_ca_mgL)) %>%
+  print(n = Inf)
+```
+
+> **QAQC note.** `frac_of_srp` is the size of the correction relative to
+> the signal being corrected, and it decides how much any of this
+> matters. Where it is small, the treatment of ΔCa \< 0 cannot change a
+> conclusion; where it approaches unity, the corrected series is largely
+> model output rather than measurement, and the inverse fit should be
+> reported for both series.
+>
+> Where `delta_ca_neg` is TRUE the reach gained calcium: calcite
+> dissolved rather than precipitated. The House model returns a negative
+> $n_{P,\mathrm{cop}}$ there, so the correction subtracts phosphorus,
+> which is outside the direction the model was parameterised for. No
+> precedent for this case exists in the BTC literature, so these events
+> are flagged and carried forward, and robustness of the main
+> conclusions is demonstrated across alternative treatments of them
+> rather than one treatment being asserted as correct.
+
+## 9.6 Calcium change: measurement uncertainty
+
+`ca_mass_trans_mgL` (§9.4) is a difference of two independent EDTA
+titrations, upstream and downstream. Whether an observed difference
+reflects real transport or just analytical noise depends on how large it
+is relative to that noise, which this section quantifies rather than
+asserts.
+
+The laboratory reports each titration to 0.1 mg/L, but several events
+differ by exactly that increment, which is a sign the *reporting*
+precision is finer than the *analytical* precision. Standard Methods
+3500-Ca gives two different figures for EDTA titrimetric calcium: an
+interlaboratory relative standard deviation of 9.2 %, and a relative
+error of 1.9 %. The two are not interchangeable — the first is a spread
+across labs and operators (a standard deviation), the second is a bias
+against a reference value. A standard deviation is what a z-score needs,
+so **`CA_RSD` is set to 9.2 %**: the only one of the two that is a
+standard deviation, and the conservative (larger) choice.
+
+Each of the two titrations (upstream, downstream) is treated as an
+independent measurement with relative standard deviation `CA_RSD` of its
+own concentration. For two independent errors of comparable relative
+size, the standard deviation of their difference is
+
+$$ \sigma_{\Delta\mathrm{Ca}} = \sqrt{2}\;\mathrm{CA\_RSD}\;\overline{\mathrm{Ca}} $$
+
+where $\overline{\mathrm{Ca}}$ is the mean of the upstream and
+downstream concentrations (used as the reference level since the true
+concentration is unknown) and the $\sqrt{2}$ comes from adding two
+equal-variance, independent errors in quadrature. The observed transfer
+is then expressed in units of its own uncertainty,
+$z = \Delta\mathrm{Ca}_{\mathrm{mass\ trans}} / \sigma_{\Delta\mathrm{Ca}}$;
+`flag_ca_resolved` marks events where $|z| > 1$, i.e. where the observed
+change exceeds one analytical standard deviation. No event is excluded
+by this — every row keeps its value and its flag, and the areal rate of
+§9.7 is reported for both resolved and unresolved events alike.
+
+```{r ca-uncertainty}
+CA_RSD <- 0.092   # Standard Methods 3500-Ca, EDTA titrimetric; interlaboratory
+                  # RSD. NOT the method's 1.9% relative error, which is a bias
+                  # against a reference, not a standard deviation.
+
+geochem_check <- geochem_check %>%
+  mutate(
+    ca_mean_mgL      = (ca_mgL_up + ca_mgL_down) / 2,
+    ca_delta_sd      = sqrt(2) * CA_RSD * ca_mean_mgL,
+    ca_delta_z       = ca_mass_trans_mgL / ca_delta_sd,
+    flag_ca_resolved = abs(ca_delta_z) > 1
+  )
+
+geochem_check %>%
+  select(stream, date, ca_mass_trans_mgL, ca_mean_mgL, ca_delta_sd,
+         ca_delta_z, flag_ca_resolved) %>%
+  arrange(abs(ca_delta_z)) %>%
+  print(n = Inf)
+```
+
+> **QAQC note.** `r sum(geochem_check$flag_ca_resolved)` of
+> `r nrow(geochem_check)` event-dates have `|ca_delta_z| > 1`. Given the
+> key finding of §9.4 — most reaches show a small calcium *gain* rather
+> than a loss — this uncertainty check matters most for the gains: a
+> change of +0.4 mg/L sitting at $|z|<1$ is not distinguishable from
+> analytical noise, whereas SR 2023-10-11 (−10.4 mg/L) and CD 2023-09-11
+> (−5.6 mg/L) are unambiguous regardless of this correction.
+
+## 9.7 Areal calcium precipitation rate
+
+A concentration difference alone is not comparable between reaches: 1
+mg/L lost over a 52 m reach (CD) reflects a far more intense process
+than the same 1 mg/L over 408 m (RS). Normalising by reach length and
+residence time, and by wetted area, gives a rate that **is** comparable:
+
+$$ r_A = \frac{\Delta[\mathrm{Ca}]}{L/v}\cdot 10^3 \cdot z
+   \qquad\text{(route 1: BTC hydraulics)} $$
+
+$$ r_A = \frac{Q\,\Delta[\mathrm{Ca}]}{L\,w}
+   \qquad\text{(route 2: campaign discharge)} $$
+
+Both reduce to the same quantity under continuity ($Q = v\,w\,z$) and
+are computed side by side as a mutual check: the $10^3$ in route 1
+converts $\Delta[\mathrm{Ca}]$ from mg/L to mg/m³ so both routes come
+out in the same units, mg m⁻² s⁻¹. $\Delta[\mathrm{Ca}]$ is
+`ca_mass_trans_mgL` negated (§9.4 convention: positive = calcium lost,
+matching the sign `r_A` is meant to carry), $L$ is the calcium reach
+length of `calcium_reach_change.csv` (not necessarily the BTC slug reach
+— the two differ for several events, e.g. CB 2023-08-31 at 252 m against
+162 m for the BTC reach), and $w$ is the fixed per-stream width of
+`data/field/streams_width.csv`.
+
+The two routes deliberately draw on **different** hydraulic estimates.
+Route 1 uses $v$ and $z$ from the adopted BTC hydraulics (`events`) of
+that stream-date — internally self-consistent (both derived from the
+same adopted discharge) but only defined where a single, unambiguous BTC
+event exists for the date. Two calcium dates (RA 2023-09-06, split into
+P/N slugs; RA 2023-10-05, split into upstream/downstream stations) have
+no single reach-level $v,z$ and are left `NA` in route 1, flagged
+`flag_no_btc_v`; route 2 is unaffected since it does not depend on a BTC
+event at all. Route 2 uses $Q$ from `discharge_for_calcium.csv`, per
+Kauan's decision to use the probe/handheld-derived discharge there since
+the calcium grabs and the discharge gaugings share the same manual
+sampling scheme. Where the two routes disagree, the disagreement is
+attributed to the hydraulic terms ($v$, $z$, $Q$, or $w$), not to the
+chemistry, since both start from the same $\Delta[\mathrm{Ca}]$ and $L$.
+
+`streams_width.csv` has no entry for RC, so both of RC's event-dates are
+flagged `flag_no_width` and route 2 (and the width-dependent parts of
+the mutual check) is `NA` there — not silently substituted.
+
+Because $r_A$ is linear in $Q$, the spread across candidate discharges
+at a site (`Q_min_ponto`, `Q_max_ponto` from `qaqc_discharge_records.R`,
+and `Q_alt` for RA 2023-08-04's alternative mass reading) **is** the
+spread of the rate, so it is reported alongside the point estimate
+rather than folded into a single number.
+
+```{r ca-areal-rate}
+# Route 1 needs one unambiguous velocity and depth per stream-date, which
+# only exists for single (non-split) BTC events.
+btc_hydraulics_single <- events %>%
+  filter(is.na(station), is.na(slug_label)) %>%
+  transmute(stream, date, v_btc_ms = water_velocity_ms, z_btc_m = stream_depth_m)
+
+streams_width <- read_csv(here("data", "field", "streams_width.csv"),
+                          show_col_types = FALSE)
+
+discharge_for_calcium <- read_csv(here("data_derived", "discharge_for_calcium.csv"),
+                                  show_col_types = FALSE) %>%
+  transmute(stream = Site, date = date_ca, Q_calcium_Ls = Q_Ls,
+            Q_min_ponto, Q_max_ponto, Q_alt, flag_sem_vazao)
+
+areal_ca <- geochem_check %>%
+  transmute(stream, date, reach_length_m, ca_mass_trans_mgL,
+            ca_loss_mgL = -ca_mass_trans_mgL) %>%   # House convention: positive = lost
+  left_join(btc_hydraulics_single, by = c("stream", "date")) %>%
+  left_join(streams_width,         by = "stream") %>%
+  left_join(discharge_for_calcium, by = c("stream", "date")) %>%
+  mutate(
+    flag_no_width = is.na(mean_width_m),
+    flag_no_btc_v = is.na(v_btc_ms),
+    flag_no_q     = is.na(Q_calcium_Ls) | coalesce(flag_sem_vazao, TRUE),
+
+    r_areal_btc_mgm2s      = (ca_loss_mgL / (reach_length_m / v_btc_ms)) * 1000 * z_btc_m,
+    r_areal_campaign_mgm2s = (Q_calcium_Ls * ca_loss_mgL) / (reach_length_m * mean_width_m),
+    r_areal_Qmin_mgm2s     = (Q_min_ponto  * ca_loss_mgL) / (reach_length_m * mean_width_m),
+    r_areal_Qmax_mgm2s     = (Q_max_ponto  * ca_loss_mgL) / (reach_length_m * mean_width_m),
+    r_areal_Qalt_mgm2s     = (Q_alt        * ca_loss_mgL) / (reach_length_m * mean_width_m),
+
+    # per-day convenience unit alongside the SI (mg m-2 s-1) value
+    r_areal_campaign_mgm2d = r_areal_campaign_mgm2s * 86400,
+
+    route_disagreement_pct = 100 * (r_areal_btc_mgm2s - r_areal_campaign_mgm2s) /
+                              r_areal_campaign_mgm2s
+  ) %>%
+  arrange(stream, date)
+
+areal_ca %>%
+  select(stream, date, ca_loss_mgL, reach_length_m, mean_width_m,
+         r_areal_btc_mgm2s, r_areal_campaign_mgm2s, r_areal_campaign_mgm2d,
+         route_disagreement_pct, flag_no_width, flag_no_btc_v, flag_no_q) %>%
+  print(n = Inf)
+
+cat("\n--- espalhamento da vazao (rota da campanha) ---\n")
+areal_ca %>%
+  select(stream, date, r_areal_Qmin_mgm2s, r_areal_campaign_mgm2s,
+         r_areal_Qmax_mgm2s, r_areal_Qalt_mgm2s) %>%
+  print(n = Inf)
+
+write_csv(areal_ca, here("data_derived", "calcium_areal_rate.csv"))
+
+dict_ca_uncertainty <- tribble(
+  ~column, ~unit, ~description,
+  "ca_mean_mgL",     "mg/L", "Mean of ca_mgL_up and ca_mgL_down; reference level for the relative-uncertainty propagation",
+  "ca_delta_sd",      "mg/L", "sqrt(2)*CA_RSD*ca_mean_mgL; propagated SD of ca_mass_trans_mgL from two independent EDTA titrations",
+  "ca_delta_z",       "-",    "ca_mass_trans_mgL / ca_delta_sd",
+  "flag_ca_resolved", "-",    "TRUE when |ca_delta_z| > 1, i.e. the observed calcium change exceeds one analytical standard deviation"
+)
+
+dict_areal_ca <- tribble(
+  ~column, ~unit, ~description,
+  "ca_loss_mgL",             "mg/L",        "-ca_mass_trans_mgL; positive = calcium lost (House convention, matches Section 9.4)",
+  "v_btc_ms",                 "m/s",         "water_velocity_ms from events, single (non-split) BTC event on that stream-date only",
+  "z_btc_m",                  "m",           "stream_depth_m from events, same restriction as v_btc_ms",
+  "mean_width_m",             "m",           "Fixed per-stream reach width, data/field/streams_width.csv; no entry for RC",
+  "Q_calcium_Ls",              "L/s",         "Discharge assigned to this calcium sampling, discharge_for_calcium.csv (probe/handheld scheme)",
+  "r_areal_btc_mgm2s",         "mg m-2 s-1", "Areal calcium rate, route 1 (BTC v, z); NA where v_btc_ms/z_btc_m undefined",
+  "r_areal_campaign_mgm2s",    "mg m-2 s-1", "Areal calcium rate, route 2 (campaign Q); NA where width or Q undefined",
+  "r_areal_campaign_mgm2d",    "mg m-2 d-1", "r_areal_campaign_mgm2s * 86400; reporting convenience only",
+  "r_areal_Qmin_mgm2s",        "mg m-2 s-1", "Route 2 at Q_min_ponto (lowest discharge on record at that site)",
+  "r_areal_Qmax_mgm2s",        "mg m-2 s-1", "Route 2 at Q_max_ponto (highest discharge on record at that site)",
+  "r_areal_Qalt_mgm2s",        "mg m-2 s-1", "Route 2 at Q_alt; only defined for RA 2023-08-04 (alternative 12 kg mass reading)",
+  "route_disagreement_pct",   "%",           "100*(r_areal_btc - r_areal_campaign)/r_areal_campaign; large values flag hydraulic, not chemical, disagreement",
+  "flag_no_width",             "-",          "TRUE when streams_width.csv has no entry for this stream (currently RC)",
+  "flag_no_btc_v",             "-",          "TRUE when no single BTC event exists for this stream-date (split events or no logger event that day)",
+  "flag_no_q",                 "-",          "TRUE when discharge_for_calcium.csv carries no usable Q for this date"
+)
+
+write_csv(bind_rows(dict_ca_uncertainty, dict_areal_ca),
+          here("data_derived", "dictionary", "dict_geochem_extra.csv"))
+```
+
+> **QAQC note.** Where both routes are defined, `route_disagreement_pct`
+> is the diagnostic — a large disagreement flags the hydraulics, not a
+> chemistry problem, since both routes share the same
+> $\Delta[\mathrm{Ca}]$ and $L$. `r_areal_campaign_mgm2d` is reported
+> purely for interpretability (a manuscript reads more naturally in mg
+> m⁻² d⁻¹ than mg m⁻² s⁻¹); the SI value is what all comparisons in this
+> document use. This is new analysis, not yet cross-checked against
+> literature co-precipitation rates — treat the point estimates as
+> provisional until that comparison is done.
+
+```{r coprec-export}
+write_csv(btc_nutrients, here("data_derived", "btc_nutrients.csv"))
+saveRDS(btc_nutrients,   here("data_derived", "btc_nutrients.rds"))
+write_csv(geochem_check, here("data_derived", "geochem_check.csv"))
+
+dict_coprec <- tribble(
+  ~column, ~unit, ~description,
+  "a_PO4",               "-",     "PO4(3-) activity, PHREEQC, downstream solution",
+  "a_HPO4",              "-",     "HPO4(2-) activity, PHREEQC, downstream solution",
+  "k1_langmuir",         "-",     "Two-component Langmuir constant for PO4(3-), Arrhenius in temp_c",
+  "k2_langmuir",         "-",     "Two-component Langmuir constant for HPO4(2-), Arrhenius in temp_c",
+  "h_adsorbed",          "-",     "Fraction of dissolved phosphate liable to sorb onto new calcite",
+  "delta_ca_mgL",        "mg/L",  "ca_mgL_up - ca_mgL_down, synoptic pair on arrival; positive = Ca lost",
+  "p_coprec_ugL",        "ug/L",  "Inorganic P co-precipitated with calcite, House (1990)",
+  "conc_corr_coprec_ugL","ug/L",  "conc_corr_ugL + p_coprec_ugL; SRP without abiotic removal. NA for NH4-N",
+  "flag_delta_ca_neg",   "-",     "TRUE when the reach gained calcium; model not parameterised for this direction"
+)
+
+write_csv(bind_rows(dict_btc_nutrients, dict_coprec),
+          here("data_derived", "dictionary", "dict_btc_nutrients.csv"))
+
+dim(btc_nutrients)
+dict_coprec
+```
+
+## 9.8 Sensitivity of the coprecipitation correction to σ
+
+`SIGMA_P` is the single most consequential constant in this correction —
+`p_coprec_ugL` is exactly linear in it — and the published estimates
+cluster into two physically distinct classes rather than forming one
+continuous range: field/river waters (0.055–0.095 µmol/m², River Frome,
+River Windrush, the Waterston chalk aquifer) and idealised synthetic
+Ca(HCO₃)₂ solutions (0.13–0.22 µmol/m²), which run 2–4× higher because
+they lack the competing solutes (Mg, Fe, dissolved organic matter) that
+occupy sorption sites in real water. `SIGMA_P` (§9.5) adopts the low end
+of the field cluster — River Frome, 5.5e-8 mol/m² — following Cohen et
+al. (2013)'s identical choice for a directly analogous karst stream;
+this section carries the rest of the field cluster and the laboratory
+ceiling forward as an explicit envelope rather than asserting the point
+estimate as the only possibility.
+
+```{r coprec-sigma-sensitivity}
+# p_coprec_molL was built as delta_ca_molL * (SIGMA_P * N_AVOG * D_CALCITE) * h_adsorbed,
+# so for fixed delta_ca and h it is exactly proportional to SIGMA_P: rescaling
+# the already-computed p_coprec_ugL is equivalent to, and cheaper than,
+# rebuilding the join for each candidate sigma.
+SIGMA_SENS <- c(
+  field_low   = 5.5e-8,  # River Frome (House et al. 1986a) -- ADOPTED, = SIGMA_P
+  field_high  = 9.5e-8,  # Waterston chalk aquifer (House et al. 1986a), field cluster upper end
+  lab_ceiling = 1.5e-7   # synthetic Ca(HCO3)2 (House & Donaldson 1986); Cohen et al. (2013)'s
+                         # laboratory upper-bound comparison value
+)
+stopifnot(isTRUE(all.equal(unname(SIGMA_SENS["field_low"]), SIGMA_P)))
+
+coprec_sigma_sens <- btc_nutrients %>%
+  filter(solute == "SRP", !is.na(p_coprec_ugL)) %>%
+  select(event_id, sample_btc, p_coprec_ugL, conc_corr_ugL) %>%
+  crossing(sigma_label = names(SIGMA_SENS)) %>%
+  mutate(
+    sigma_molm2       = SIGMA_SENS[sigma_label],
+    p_coprec_ugL_sens = p_coprec_ugL * (sigma_molm2 / SIGMA_P),
+    frac_of_srp_sens  = p_coprec_ugL_sens / conc_corr_ugL
+  )
+
+coprec_sigma_sens %>%
+  group_by(event_id, sigma_label) %>%
+  summarise(
+    sigma_umolm2        = first(sigma_molm2) * 1e6,
+    coprec_median_ugL   = median(p_coprec_ugL_sens, na.rm = TRUE),
+    frac_of_srp_median  = median(frac_of_srp_sens,  na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(id_cols = event_id, names_from = sigma_label,
+              values_from = c(coprec_median_ugL, frac_of_srp_median)) %>%
+  arrange(event_id) %>%
+  print(n = Inf)
+
+write_csv(coprec_sigma_sens, here("data_derived", "coprec_sigma_sensitivity.csv"))
+
+dict_coprec_sigma_sens <- tribble(
+  ~column, ~unit, ~description,
+  "sigma_label",       "-",      "field_low (adopted, River Frome) / field_high (Waterston aquifer) / lab_ceiling (synthetic solution)",
+  "sigma_molm2",        "mol/m2", "SIGMA_P value used for this row, from SIGMA_SENS",
+  "p_coprec_ugL_sens",  "ug/L",   "p_coprec_ugL rescaled to sigma_molm2; linear rescaling of the SIGMA_P-based value",
+  "frac_of_srp_sens",   "-",      "p_coprec_ugL_sens / conc_corr_ugL, at this sigma"
+)
+write_csv(dict_coprec_sigma_sens,
+          here("data_derived", "dictionary", "dict_coprec_sigma_sensitivity.csv"))
+```
+
+> **QAQC note.** This is the same check Cohen et al. (2013) ran on the
+> Ichetucknee: moving from the field value to the laboratory ceiling
+> should not be treated as a free parameter choice, because at the
+> laboratory end `frac_of_srp` can approach or exceed unity — the point
+> where the corrected series stops being a correction and becomes mostly
+> model output (§9.5's QAQC note). Where `frac_of_srp_sens` stays small
+> across the whole field-to-lab envelope, the choice of `SIGMA_P` cannot
+> change a conclusion; where it diverges sharply between `field_low` and
+> `lab_ceiling`, that divergence — not the point estimate — is what
+> belongs in the manuscript, alongside the physical argument (§9.5) for
+> why the field cluster is the appropriate class for a stream rather
+> than a synthetic solution.
+
+## 9.9 Event-level mass balance: does the correction respect the injected P mass?
+
+`frac_of_srp` (§9.5) is a per-grab, concentration-domain ratio: at each
+sampled instant, how large the correction is relative to the SRP
+measured at that instant. The `median(frac_of_srp)` printed there is the
+size of a *typical* correction, not the size of what the event actually
+lost — it weighs every grab equally regardless of when it was taken or
+how much water carried it, and `h_adsorbed` tracks phosphate speciation
+(§9.2), so `p_coprec_ugL` rises and falls with SRP across the curve
+while most events sample the tail more densely than the peak. A median
+across grabs is therefore not a mass balance.
+
+The mass-domain question — how much elemental P did coprecipitation
+remove from the whole event, and is that plausible against the P
+actually injected — needs a discharge-weighted integral over the sampled
+curve, the same construction §6 already uses to get discharge from the
+NaCl mass balance (`hydro_probe`'s `integral_Ct_mgLs`, `pracma::trapz`):
+
+$$ m_{P,\mathrm{cop}} = Q \int_0^{T} C_{P,\mathrm{cop}}(t)\,dt
+   \qquad
+   m_{\mathrm{SRP}} = Q \int_0^{T} C_{\mathrm{corr}}(t)\,dt $$
+
+with $Q$ the adopted event discharge (`discharge_Ls`, treated as steady
+over the duration of a single slug event, matching §6's own convention)
+and the integral taken by trapezoidal rule over the sampled
+`time_since_release_s`. Two ratios follow:
+
+$$ f_{\mathrm{mass}} = \frac{m_{P,\mathrm{cop}}}{m_{\mathrm{SRP}}}
+   \qquad
+   \%_{\mathrm{injectate}} = 100\,\frac{m_{P,\mathrm{cop}}}{m_{P,\mathrm{added}}} $$
+
+`f_mass` is the mass-weighted analogue of `frac_of_srp` and is the
+number to compare it against. `%_injectate` is an independent physical
+check that does not use `conc_corr_ugL` at all — it asks what fraction
+of the elemental P mass released at the addition point was removed by
+coprecipitation before it passed the sampling station. `m_P,added`
+converts the phosphate-salt mass on the field sheet (`added_mass_PO4_g`,
+`molar_mass_P_nutrient`, `nutrient_addition_phosphate_data.csv`) to
+elemental P using the same molar-mass ratio, not the salt mass itself.
+
+`p_coprec_ugL` is integrated as measured, not clamped at zero: a
+negative value is a real model output at `flag_delta_ca_neg` events (the
+reach gained calcium — §9.5 already documents the model is not
+parameterised for that direction), and clipping it would silently
+overstate the correction there. `conc_corr_ugL` is clamped at zero in
+its integral, matching the convention already used for `nacl_mgL_grab`
+in §6 (a background-corrected concentration can dip slightly negative
+from measurement noise around a zero baseline; a transported mass cannot
+be physically negative).
+
+```{r coprec-mass-balance}
+p_added <- p_raw %>%
+  distinct(stream, date, added_mass_PO4_g, molar_mass_P_nutrient)
+stopifnot(!anyDuplicated(p_added[c("stream", "date")]))
+
+coprec_mass_balance <- btc_nutrients %>%
+  filter(solute == "SRP", !is.na(p_coprec_ugL)) %>%
+  select(event_id, stream, date, time_since_release_s, conc_corr_ugL,
+         p_coprec_ugL, flag_delta_ca_neg) %>%
+  left_join(events %>% select(event_id, discharge_Ls, flag_discharge_invalid),
+            by = "event_id") %>%
+  left_join(p_added, by = c("stream", "date")) %>%
+  arrange(event_id, time_since_release_s) %>%
+  group_by(event_id) %>%
+  summarise(
+    n                      = n(),
+    t_span_s               = diff(range(time_since_release_s, na.rm = TRUE)),
+    discharge_Ls           = first(discharge_Ls),
+    flag_discharge_invalid = first(flag_discharge_invalid),
+    flag_delta_ca_neg      = first(flag_delta_ca_neg),
+    # conc_corr_ugL can be NA on a grab even when p_coprec_ugL is
+    # defined (a bad concentration reading does not stop the
+    # geochemical calc, which does not use conc_corr_ugL at all).
+    # A single NA in the window propagates through pmax()/trapz()
+    # to NA for mass_srp_exported_ug and therefore frac_mass_coprec,
+    # while mass_p_coprec_ug and pct_of_injectate_coprec (below) are
+    # unaffected -- this flag names that asymmetry instead of
+    # leaving it to be reverse-engineered from a bare NA.
+    flag_conc_corr_na_in_window = anyNA(conc_corr_ugL),
+    added_mass_PO4_g       = first(added_mass_PO4_g),
+    molar_mass_P_nutrient  = first(molar_mass_P_nutrient),
+    # discharge-weighted trapezoidal integral over the sampled curve; NA
+    # where there are too few points to integrate or no valid discharge
+    # (mirrors the guard already used for integral_Ct_mgLs in Sec. 6).
+    mass_srp_exported_ug = if (n >= 3 && t_span_s > 0 && !is.na(discharge_Ls))
+                             discharge_Ls *
+                               pracma::trapz(time_since_release_s, pmax(conc_corr_ugL, 0))
+                           else NA_real_,
+    mass_p_coprec_ug     = if (n >= 3 && t_span_s > 0 && !is.na(discharge_Ls))
+                             discharge_Ls *
+                               pracma::trapz(time_since_release_s, p_coprec_ugL)
+                           else NA_real_,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    frac_mass_coprec        = mass_p_coprec_ug / mass_srp_exported_ug,
+    mass_P_added_g          = added_mass_PO4_g * (M_P / molar_mass_P_nutrient),
+    pct_of_injectate_coprec = 100 * (mass_p_coprec_ug / 1e6) / mass_P_added_g,
+    flag_insufficient_samples     = n < 3,
+    flag_coprec_exceeds_injectate = !is.na(pct_of_injectate_coprec) &
+                                     pct_of_injectate_coprec > 100
+  ) %>%
+  arrange(desc(frac_mass_coprec))
+
+coprec_mass_balance %>%
+  select(event_id, n, discharge_Ls, frac_mass_coprec, pct_of_injectate_coprec,
+         flag_delta_ca_neg, flag_discharge_invalid, flag_insufficient_samples,
+         flag_coprec_exceeds_injectate, flag_conc_corr_na_in_window) %>%
+  print(n = Inf)
+
+write_csv(coprec_mass_balance, here("data_derived", "coprec_mass_balance.csv"))
+
+dict_coprec_mass_balance <- tribble(
+  ~column, ~unit, ~description,
+  "event_id",                     "-",     "Event key",
+  "n",                             "-",     "Number of SRP grabs with a defined p_coprec_ugL",
+  "t_span_s",                      "s",     "Time span covered by those grabs; integration domain",
+  "discharge_Ls",                  "L/s",   "Adopted event discharge (events$discharge_Ls), treated as steady over the event",
+  "mass_srp_exported_ug",          "ug",    "discharge_Ls * trapz(time_since_release_s, pmax(conc_corr_ugL, 0)); background-corrected SRP mass transported past the station over the sampled window",
+  "mass_p_coprec_ug",              "ug",    "discharge_Ls * trapz(time_since_release_s, p_coprec_ugL); P mass removed by coprecipitation over the sampled window. Not clamped at zero -- see prose",
+  "frac_mass_coprec",              "-",     "mass_p_coprec_ug / mass_srp_exported_ug; mass-weighted, event-integrated analogue of the per-grab median frac_of_srp in Sec. 9.5",
+  "added_mass_PO4_g",              "g",     "Mass of the phosphate salt added, nutrient_addition_phosphate_data.csv",
+  "molar_mass_P_nutrient",         "g/mol", "Molar mass of the salt added (type_P)",
+  "mass_P_added_g",                "g",     "added_mass_PO4_g * (M_P / molar_mass_P_nutrient); elemental P mass injected",
+  "pct_of_injectate_coprec",       "%",     "100 * (mass_p_coprec_ug/1e6) / mass_P_added_g; independent check, does not use conc_corr_ugL",
+  "flag_delta_ca_neg",             "-",     "Carried from Sec. 9.5: TRUE when the reach gained calcium (model not parameterised for that direction)",
+  "flag_discharge_invalid",        "-",     "Carried from Sec. 6: TRUE when no valid discharge estimate exists for this event",
+  "flag_insufficient_samples",     "-",     "TRUE when n < 3 (cannot integrate); mass columns are NA",
+  "flag_coprec_exceeds_injectate", "-",     "TRUE when pct_of_injectate_coprec > 100 -- physically impossible, flags a remaining error rather than a real effect",
+  "flag_conc_corr_na_in_window",   "-",     "TRUE when any conc_corr_ugL in the window is NA; frac_mass_coprec is then NA but pct_of_injectate_coprec (independent of conc_corr_ugL) is not -- expected, not a bug"
+)
+
+write_csv(dict_coprec_mass_balance,
+          here("data_derived", "dictionary", "dict_coprec_mass_balance.csv"))
+
+dict_coprec_mass_balance
+```
+
+> **QAQC note.** `frac_mass_coprec` is the number that should be
+> compared to the per-grab median in §9.5, not treated as a replacement
+> for it — a large gap between the two says the loss is concentrated in
+> part of the curve the median under- or over-weights, which is itself
+> worth reporting. `pct_of_injectate_coprec` is the stronger check: it
+> is built from the addition record alone (`added_mass_PO4_g`,
+> `molar_mass_P_nutrient`) and the coprecipitation model, with no
+> dependence on the measured downstream SRP series, so it cannot inherit
+> an error from `conc_corr_ugL`. Any
+> `flag_coprec_exceeds_injectate == TRUE` means the model is predicting
+> more P removed than was released — physically impossible — and should
+> be read as evidence of a remaining unit or join error, not as a real
+> effect, per the same standard applied to `SIGMA_P` and the PHREEQC
+> unit fixes earlier in this section.
+>
+> `flag_conc_corr_na_in_window` explains the one asymmetric case:
+> `frac_mass_coprec` can be `NA` while `pct_of_injectate_coprec` is not,
+> because a single `NA` in `conc_corr_ugL` propagates through the
+> `mass_srp_exported_ug` integral but `mass_p_coprec_ug` never uses
+> `conc_corr_ugL` at all. This is expected behaviour, not a second bug.
+>
+> **A note on circularity.** `p_coprec_ugL` — and therefore
+> `conc_corr_coprec_ugL` — is a deterministic function of `delta_ca_mgL`
+> (§9.2). Any uptake metric computed from the corrected series (Sw, Vf,
+> areal uptake, or otherwise) therefore carries a component that is
+> mechanically linear in ΔCa by construction, independent of any real
+> biological or abiotic process. Comparing that metric, once corrected,
+> back against ΔCa or calcium transfer and reporting agreement as
+> confirmation of the coprecipitation mechanism is circular — the
+> correction was built from ΔCa, so some relationship between the two is
+> guaranteed rather than discovered. The evidence that is not circular
+> is the relationship measured on the *uncorrected* series (nothing in
+> `conc_corr_ugL` depends on ΔCa) and the independent mass-balance check
+> above (`pct_of_injectate_coprec`, built from the addition record, not
+> from ΔCa or the corrected concentration). A relationship that is
+> absent uncorrected and appears only after applying the correction is
+> particularly worth treating with suspicion for this reason before
+> being reported as a finding — it is at least as consistent with the
+> correction's own linear structure as with a newly-revealed process.
+
+# 10. Consolidated master dataset for inverse TSM
+
+Earlier versions of this section built one dataset for the RA reach
+only, and explicitly excluded 2023-10-05 (both stations) from it: that
+day's SRP series is erratic (swings from -3 to +120 µg/L point to point,
+no coherent rise-fall shape), a broken NaCl-nutrient pairing traced to
+the same pre-tracer instrument step documented in Section 3, and not to
+co-precipitation (`03` §1.1 shows the predicted correction is the same
+negligible order for both RA dates). That exclusion contradicted this
+project's own standing rule: quantify and flag uncertainty, never
+silently drop a stream. **It is reversed here.**
+
+This section now builds one master table across **every** event with a
+nutrient series — nothing is dropped. Discharge and reach geometry come
+from each event's own individually-adopted value in `events` (Section
+6), \*\*with no override, including for RA_20230906_N/\_P\*\*: each
+slug's own hydraulics (`water_velocity_ms`, `stream_depth_m`, and
+whatever an inverse model derives from its own BTC) must stay internally
+consistent with the same discharge that was used to derive them in
+Section 6. As of Section 6's latest correction, `discharge_Ls` for
+RA_20230906_N, RA_20230906_P, and RA_20231005_downstream is now the
+probe (handheld trapezoidal) estimate rather than the manual Excel value
+— each still carries its own individually-adopted number, not a shared
+one. What the two RA_20230906 slugs' reach genuinely shares that day —
+one physical river, one set of survey geometry — is a separate,
+explicitly-labelled reference pair, `discharge_Ls_day_mean`/`_sd` (mean
+and sd of the two slugs' own adopted `discharge_Ls`), populated only for
+those two rows and not substituted into `discharge_Ls` anywhere. To make
+the logger-vs-probe-vs-manual picture fully inspectable from this table
+alone — not just from `events.csv` — the raw per-source estimates
+(`discharge_Ls_logger`, `discharge_Ls_probe`, `discharge_Ls_manual`),
+the adopted method, and the reason the logger was rejected where it was
+are carried forward here too. Every known data-quality problem —
+RA_20231005 upstream's incomplete mixing, RA_20231005's broken pairing
+(both stations), missing baselines, a peak barely above background,
+sparse recessions, discharge that could not be estimated at all — is
+carried forward as an explicit flag column instead. Whether to use,
+weight, or exclude a flagged event is a modelling decision made
+downstream of this table, not a decision this pipeline makes on anyone's
+behalf; RA_20231005_upstream in particular is expected to sit unused as
+a reference row for now.
+
+```{r ra-reach-discharge}
+# Day-level reference discharge for the two RA 2023-09-06 slugs, ~2h15min
+# apart, same physical reach. Built from each slug's own ADOPTED
+# discharge_Ls in `events` -- not a hardcoded pair of numbers -- so this
+# stays consistent automatically if Section 6's source decision for either
+# slug ever changes again (it already has once: manual -> probe). This
+# mean is NOT substituted into either event's own discharge_Ls below --
+# each slug's own velocity/depth were derived from its own value, and
+# overwriting it would break that internal consistency. It is instead
+# kept as a day-level REFERENCE for what the river's discharge looked
+# like that day (mean of two independent estimates of the same
+# underlying flow, spread carried as uncertainty rather than picking
+# one) -- available if a future step wants a single characterising Q
+# for 2023-09-06, not used by this table itself.
+ra_q_lookup <- events %>%
+  filter(event_id %in% c("RA_20230906_N", "RA_20230906_P")) %>%
+  select(event_id, discharge_Ls)
+
+stopifnot(nrow(ra_q_lookup) == 2, !anyNA(ra_q_lookup$discharge_Ls))
+
+RA_Q_VALUES   <- set_names(ra_q_lookup$discharge_Ls, ra_q_lookup$event_id)
+RA_Q_MEAN_LS  <- mean(RA_Q_VALUES)
+RA_Q_SD_LS    <- sd(RA_Q_VALUES)
+
+tibble(discharge_Ls_mean = RA_Q_MEAN_LS, discharge_Ls_sd = RA_Q_SD_LS,
+       cv_pct = 100 * RA_Q_SD_LS / RA_Q_MEAN_LS)
+```
+
+> **QAQC note.** `sd()` on two points is `abs(diff(x))/sqrt(2)` —
+> reported here because it is the standard, honest way to carry a
+> 2-value spread forward, not because n=2 supports a distributional
+> claim. The mean/sd printed above is carried in the master table below
+> as `discharge_Ls_day_mean`/`_sd`, a reference value only;
+> `discharge_Ls` for RA_20230906_N and RA_20230906_P stays each slug's
+> own adopted value, exactly as in `events`/`hydraulics`.
+
+```{r master-tsm-export}
+# Day-level reference discharge for RA 2023-09-06 only (see prose and
+# QAQC note above) -- NA for every other event, including RA_20231005.
+# Not used to compute discharge_Ls, water_velocity_ms, or stream_depth_m
+# anywhere in this table.
+ra_day_reference <- tibble(
+  event_id                  = names(RA_Q_VALUES),
+  discharge_Ls_day_mean     = RA_Q_MEAN_LS,
+  discharge_Ls_day_mean_sd  = RA_Q_SD_LS
+)
+
+master_hydraulics <- events %>%
+  select(event_id, discharge_Ls, reach_length_m, reach_mean_width_m,
+         discharge_source, discharge_method, reason_discharge,
+         discharge_Ls_logger, discharge_Ls_probe, discharge_Ls_manual,
+         flag_discharge_invalid, flag_mixing_incomplete,
+         flag_no_baseline, flag_weak_signal, flag_sparse_recession) %>%
+  left_join(ra_day_reference, by = "event_id") %>%
+  mutate(
+    # RA 2023-10-05, both stations: erratic SRP series, broken NaCl
+    # pairing (see prose above). NOT excluded -- flagged.
+    # RA_20231005_downstream already carries flag_no_baseline == TRUE
+    # (Section 6, contaminated start anchor) and RA_20231005_upstream
+    # already carries flag_mixing_incomplete == TRUE; this flag is the
+    # additional, independent problem with the nutrient pairing itself.
+    flag_broken_pairing = event_id %in% c("RA_20231005_upstream",
+                                          "RA_20231005_downstream")
+  )
+
+# guard: one hydraulics row per event, so the join below cannot
+# multiply rows.
+stopifnot(!anyDuplicated(master_hydraulics$event_id))
+
+master_tsm <- btc_nutrients %>%
+  left_join(master_hydraulics, by = "event_id") %>%
+  arrange(event_id, solute, time_since_release_s)
+
+# guard: every event in btc_nutrients survives the join (left_join
+# cannot drop left-table rows, but a name/type mismatch could still
+# silently produce all-NA hydraulics -- catch that here), and wherever
+# discharge_Ls itself is NA, flag_discharge_invalid says so.
+stopifnot(setequal(unique(master_tsm$event_id), unique(btc_nutrients$event_id)))
+stopifnot(all(master_tsm$flag_discharge_invalid[is.na(master_tsm$discharge_Ls)]))
+
+write_csv(master_tsm, here("data_derived", "master_tsm.csv"))
+saveRDS(master_tsm,   here("data_derived", "master_tsm.rds"))
+
+master_tsm %>%
+  distinct(event_id, discharge_Ls, discharge_source, discharge_method,
+           discharge_Ls_logger, discharge_Ls_probe, discharge_Ls_manual,
+           discharge_Ls_day_mean, flag_discharge_invalid,
+           flag_mixing_incomplete, flag_no_baseline, flag_weak_signal,
+           flag_sparse_recession, flag_broken_pairing) %>%
+  arrange(event_id) %>%
+  print(n = Inf)
+
+dict_master_tsm_extra <- tribble(
+  ~column, ~unit, ~description,
+  "discharge_Ls",             "L/s", "Adopted event discharge, taken straight from events$discharge_Ls with no override for any event -- source given by discharge_source/discharge_method",
+  "reach_length_m",            "m",   "events$reach_length_m, unchanged for every event",
+  "reach_mean_width_m",        "m",   "events$reach_mean_width_m, unchanged for every event",
+  "discharge_source",          "-",   "logger / probe / manual_excel / NA, from events, unchanged for every event",
+  "discharge_method",          "-",   "Method behind the adopted discharge_Ls (logger_trapz_truepeak / probe_trapz_endrising / manual_fixed_background)",
+  "reason_discharge",          "-",   "Why the logger was not used, where it was not; NA when the logger is the adopted source",
+  "discharge_Ls_logger",       "L/s", "Raw logger-based trapezoidal estimate (Sec. 6), independent of which source was adopted; NA where no usable logger series exists",
+  "discharge_Ls_probe",        "L/s", "Raw handheld/probe-based trapezoidal estimate (Sec. 6), independent of which source was adopted; currently the adopted source for RA_20230906_N/_P and RA_20231005_downstream",
+  "discharge_Ls_manual",       "L/s", "Manual Excel value (fixed background, negatives retained), Sec. 6; kept as reference only -- not the adopted source for any event as of this revision",
+  "discharge_Ls_day_mean",     "L/s", "mean(each slug's own adopted discharge_Ls), RA_20230906_N/_P only; NA for every other event. A reference value for the river's discharge that day -- NOT used to compute discharge_Ls or anything derived from it in this table",
+  "discharge_Ls_day_mean_sd",  "L/s", "sd() of the same two adopted values, RA_20230906_N/_P only; NA elsewhere",
+  "flag_discharge_invalid",    "-",   "TRUE when no usable discharge exists for this event -- currently RA_20231005_upstream only",
+  "flag_mixing_incomplete",    "-",   "TRUE for RA_20231005_upstream: logger sampled the plume core, not a well-mixed cross-section, so the dilution-gauging premise fails",
+  "flag_no_baseline",          "-",   "TRUE when the window carries no clean pre-release baseline (RA_20230906_N, RA_20231005_downstream)",
+  "flag_weak_signal",          "-",   "TRUE when the adopted trapezoidal estimate's peak is only marginally above background noise (RA_20230906_P: ~3%)",
+  "flag_sparse_recession",     "-",   "TRUE when one unsampled interval holds >30% of the handheld trapezoidal area",
+  "flag_broken_pairing",       "-",   "TRUE for RA_20231005 (both stations): SRP series is erratic (-3 to +120 ug/L point to point, no coherent shape) and the NaCl pairing is at or near zero for nearly the whole grab window, per Section 3 and 03 Sec 1.1. NOT excluded from this table -- using, weighting, or dropping these rows is a modelling decision, not a pipeline decision"
+)
+write_csv(bind_rows(dict_btc_nutrients, dict_coprec, dict_master_tsm_extra),
+          here("data_derived", "dictionary", "dict_master_tsm.csv"))
+
+nrow(master_tsm)
+dict_master_tsm_extra
+```
+
+> **QAQC note.** This table replaces the RA-only `ra_reach_tsm` /
+> `RA_reach_tsm.csv` from earlier versions of this section, which
+> excluded RA_20231005 outright. Every event is here now, and
+> `flag_broken_pairing`, `flag_discharge_invalid`,
+> `flag_mixing_incomplete`, `flag_no_baseline`, and `flag_weak_signal`
+> are how a modelling step should decide what to do with a given event,
+> not something this pipeline decides on its behalf.
+> RA_20231005_upstream in particular is expected to sit unused, as a
+> reference row, until there is a specific reason to touch it.
+> `discharge_Ls_logger`/`_probe`/`_manual` are all carried here (not
+> just `discharge_Ls`) specifically so this table alone supports a
+> source-vs-source comparison — see the 1:1 plot in Section 6 for the
+> logger-vs-probe picture across all events. Running the inverse model
+> on all events, dropping the flagged ones, or running a sensitivity
+> comparison with/without them is a choice for whichever conversation
+> builds that model next (see the handoff).
+
+```{r session-info}
+sessionInfo()
+```

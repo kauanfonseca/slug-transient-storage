@@ -1,0 +1,29 @@
+column,unit,description
+event_id,-,Event key
+solute,-,NH4-N or SRP
+datetime,-,Reconstructed as addition_datetime + time_since_addition_s
+time_since_release_s,s,Elapsed time from the release anchoring this slug
+anchor_drift_s,s,Disagreement between spreadsheet clock and reconstructed timestamp
+sample_btc,-,Sample identifier along the breakthrough curve
+curve_limb,-,rising / peak / falling
+conc_ugL,ug/L,Measured nutrient concentration
+background_ugL,ug/L,Ambient nutrient concentration before release
+conc_corr_ugL,ug/L,Background-corrected nutrient concentration
+spc_uscm_grab,uS/cm,SpC read with the handheld probe
+spc_corr_uscm_grab,uS/cm,Background-corrected SpC from the spreadsheet (constant background)
+spc_uscm_logger,uS/cm,Logger SpC interpolated at the grab timestamp
+nacl_mgL_grab,mg/L,NaCl from spc_corr_uscm_grab using NACL_SLOPE
+nacl_mgL_grab_src,mg/L,NaCl as it appears in the source spreadsheet
+nacl_mgL_logger,mg/L,Logger NaCl interpolated at the grab timestamp
+nacl_mgL,mg/L,"Value used downstream; logger where available, grab otherwise"
+nacl_source,-,logger_interpolated or handheld_grab
+gap_s,s,Distance to the nearest logger record; interpolation quality
+a_PO4,-,"PO4(3-) activity, PHREEQC, downstream solution"
+a_HPO4,-,"HPO4(2-) activity, PHREEQC, downstream solution"
+k1_langmuir,-,"Two-component Langmuir constant for PO4(3-), Arrhenius in temp_c"
+k2_langmuir,-,"Two-component Langmuir constant for HPO4(2-), Arrhenius in temp_c"
+h_adsorbed,-,Fraction of dissolved phosphate liable to sorb onto new calcite
+delta_ca_mgL,mg/L,"ca_mgL_up - ca_mgL_down, synoptic pair on arrival; positive = Ca lost"
+p_coprec_ugL,ug/L,"Inorganic P co-precipitated with calcite, House (1990)"
+conc_corr_coprec_ugL,ug/L,conc_corr_ugL + p_coprec_ugL; SRP without abiotic removal. NA for NH4-N
+flag_delta_ca_neg,-,TRUE when the reach gained calcium; model not parameterised for this direction

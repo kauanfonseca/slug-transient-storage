@@ -1,0 +1,144 @@
+---
+title: "Inverse transient-storage modelling and nutrient uptake partitioning"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 7, fig.height = 4)
+library(here)
+library(dplyr)
+library(readr)
+library(ggplot2)
+source(here("R", "tsm_model.R"))
+source(here("R", "tsm_calibrate.R"))
+source(here("R", "tsm_partition.R"))
+source(here("R", "plot_tsm_fit.R"))
+source(here("R", "run_tsm_uptake.R"))
+```
+
+## What this does
+
+This vignette estimates, for every slug event in the pipeline, how much of
+the added nitrogen (NH4-N) and phosphorus (SRP) is taken up in the reach, and
+splits that uptake between the **main channel** (attributed to biotic
+assimilation -- periphyton / water-column processes) and the **transient
+storage zone** (attributed to hyporheic/microbial and, for SRP, abiotic
+processes). It replaces OTIS-P with a direct numerical implementation of the
+same transient-storage model (Bencala & Walters 1983; Runkel 1998, OTIS) in
+R (`deSolve`), calibrated in two stages (Runkel 2007) and partitioned by the
+same four-simulation mass-balance procedure Runkel (2007) uses for OTIS
+output. See the header comments of `R/tsm_model.R`, `R/tsm_calibrate.R`, and
+`R/tsm_partition.R` for the full methodology and the equations used.
+
+In one sentence: **Stage 1** fits dispersion (D), the channel/storage
+exchange rate (alpha), and the storage-zone area (As) to the dense NaCl
+logger curve, with discharge/velocity/area held fixed at the pipeline's own
+independently-gauged values; **Stage 2** then fixes those and fits two
+first-order removal coefficients -- lambda (channel) and lambda_s (storage
+zone) -- to the sparser nutrient grabs; and the **partition step** runs four
+what-if simulations (conservative / fully reactive / channel-only /
+storage-only) to work out what fraction of the removed mass is attributable
+to each compartment (Runkel 2007).
+
+For SRP, the pipeline additionally provides `conc_corr_coprec_ugL`, the
+series with the House (1990) CaCO3 co-precipitation correction added back
+in. Running the same procedure on that series instead of the raw
+background-corrected one approximates the **biotic-only** assimilation,
+net of the abiotic co-precipitation captured by that correction -- this is
+run automatically as a second `correction` value in the output table.
+**Carry forward the circularity caveat from the project handoff (Section
+4.6/7): do not use agreement between the coprec-corrected uptake numbers and
+delta-Ca as confirmation of the co-precipitation mechanism, since the
+correction is a deterministic function of delta-Ca.**
+
+## Run the batch pipeline
+
+```{r run-batch}
+summary_tbl <- run_tsm_uptake_all(n_lhs_hydraulics = 250, n_lhs_uptake = 250, n_cells = 40, seed = 1)
+write_csv(summary_tbl, here::here("data_derived", "tsm_uptake_summary.csv"))
+summary_tbl %>%
+  select(event_id, solute, correction, fit_status, n_grabs,
+         pct_total_uptake, pct_mainchannel, pct_storagezone,
+         Sw_total_m, lambda_at_bound, lambda_s_at_bound, uptake_significant) %>%
+  knitr::kable(digits = 2)
+```
+
+### Reading the output table
+
+- `fit_status`: `"ok"`, or a reason the event/solute was skipped
+  (`too_few_grabs`, `no_addition_record`, `uptake_fit_failed`).
+- `pct_total_uptake`: percent of the injected nutrient mass removed within
+  the reach (main channel + storage zone combined), from simulations A and B.
+- `pct_mainchannel` / `pct_storagezone`: the Runkel (2007) partition of that
+  total uptake, renormalised to sum to 100. **`NA` when `uptake_significant`
+  is `FALSE`** (total uptake below 2%, i.e. lambda and lambda_s are both
+  indistinguishable from zero given this BTC) -- the split of a
+  near-nonexistent removal is not meaningful and is deliberately withheld
+  rather than reported as a spurious percentage.
+- `lambda_at_bound` / `lambda_s_at_bound`: `TRUE` when the fitted coefficient
+  sits at (or within 5% in log10 space of) the search bound -- a classic
+  sign that this particular coefficient is not well identified by this BTC
+  (Bonanno et al. 2022). This does **not** necessarily mean the fit is bad
+  (see the CB 2023-09-07 example below, where lambda pins near zero while
+  lambda_s is clearly, independently identifiable) -- always check the
+  identifiability plot (next section) before trusting a specific number.
+- `Sw_total_m`, `Sw_mainchannel_m`, `vf_*`, `U_*`: the standard nutrient
+  spiralling metrics (Stream Solute Workshop 1990; Runkel 2007), reported
+  both as a single whole-reach aggregate (`_total`, comparable to a
+  conventional Sw obtained by linear regression on steady-state data) and
+  separately for the two compartments.
+
+## Diagnostics: always look at the fit before trusting the numbers
+
+Two examples, contrasting a well-identified case with a boundary case.
+
+```{r diagnostics-well-identified}
+ev  <- read_csv(here::here("data_derived", "events.csv"))
+btc <- read_csv(here::here("data_derived", "btc_conservative.csv"))
+mtsm<- read_csv(here::here("data_derived", "master_tsm.csv"))
+
+hyd <- attr(summary_tbl, "hydraulic_fits")
+
+plot_event_fit <- function(eid, solute, hyd_fit) {
+  sub <- btc %>% filter(event_id == eid, time_since_release_s >= 0) %>% arrange(time_since_release_s)
+  e <- ev %>% filter(event_id == eid)
+  print(plot_btc_fit(sub$time_since_release_s, pmax(sub$nacl_mgL, 0),
+                      hyd_fit$L, hyd_fit$Q, hyd_fit$A,
+                      hyd_fit$D, hyd_fit$alpha, hyd_fit$As, mass = e$nacl_mass_g,
+                      title = paste(eid, "-- NaCl (conservative) fit"), unit = "mg/L"))
+}
+
+plot_event_fit("CD_20231009_single", "NH4-N", hyd[["CD_20231009_single"]])
+```
+
+Every event's hydraulic identifiability scan is available via
+`hyd[[event_id]]$lhs` (columns `D`, `alpha`, `As_ratio`, all in log10 units,
+plus `rmse`) for a Bonanno-style parameter-vs-RMSE plot:
+
+```{r identifiability-example}
+plot_identifiability(hyd[["CD_20231009_single"]]$lhs, "alpha", xlab = "alpha (1/s)")
+```
+
+## Notes and known limitations
+
+- **Numerical dispersion.** The finite-volume advection scheme is first-order
+  upwind, which carries some numerical dispersion (approximately v*dx/2).
+  Increase `n_cells` in `run_tsm_uptake_all()` and re-check that the fitted D
+  does not change materially if this matters for a specific reach.
+- **SR_20231011_single has no logger.** Per Kauan's own instruction, its
+  transient-storage hydraulics (D, alpha, As/A) are borrowed from
+  `SR_20231009_downstream` (same 72 m reach, two days earlier), but its own
+  discharge and grabs are used for everything else -- flagged in the output
+  as `hydraulics_borrowed_from`.
+- **This is a fast, practical identifiability check, not the full Bonanno et
+  al. (2022) iterative DYNIA procedure.** The global LHS scan (250 draws by
+  default) plus local refinement is enough to catch gross non-identifiability
+  and boundary solutions (see the diagnostics above), but is not an
+  exhaustive dynamic/segment-wise identifiability analysis. Treat
+  `lambda_at_bound`/`lambda_s_at_bound` as a prompt to look at the plot, not
+  as a final verdict.
+- Injected elemental N/P mass is read directly from
+  `data/nutrients/nutrient_addition_{nitrogen,phosphate}_data.csv`
+  (`added_mass_NH4Cl_g`/`molar_mass_NH4Cl_nutrient` and
+  `added_mass_PO4_g`/`molar_mass_P_nutrient`), matching exactly the
+  conversion `02_integration.Rmd` already uses for P.

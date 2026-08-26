@@ -1,0 +1,20 @@
+column,unit,description
+event_id,-,Unique event key: stream_YYYYMMDD_{slug_label|station|single}. Primary key linking all tables in this project.
+stream,-,Stream code
+date,-,Event date (Brasília time)
+station,-,"upstream / downstream for two-station slugs, NA otherwise"
+slug_label,-,"P / N for the split RA 2023-09-06 release, NA otherwise"
+datetime,-,"Logger timestamp, America/Sao_Paulo (UTC-3)"
+time_since_release_s,s,Elapsed time from the tracer addition anchoring this slug
+full_range_uscm,uS/cm,Uncompensated full-range conductivity as logged
+temp_c,degC,Water temperature
+spc_uscm,uS/cm,"Specific conductance, recalculated as full_range / (1 + 0.02*(temp_c - 25))"
+background_spc_probe,uS/cm,"Pre-release SpC from the handheld probe; independent reference, not a logger value"
+logger_serial,-,HOBO logger serial number
+source_file,-,Raw .xlsx export the observation came from
+trimmed_file,-,Trimmed CSV written by the Shiny selection app
+flag_no_pre_release,-,TRUE if the window contains no observation before the release
+flag_peak_at_edge,-,TRUE if the SpC peak falls in the outer 10% of the window
+flag_truncated_tail,-,TRUE if SpC at the end of the window is still >15% above the window minimum
+flag_logging_gap,-,TRUE if the largest inter-record gap exceeds 5x the median logging interval
+flag_na_present,-,TRUE if any SpC value is missing
