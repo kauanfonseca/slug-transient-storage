@@ -645,12 +645,27 @@ value \~4.3 from the other sensor), RA 2023-10-05 reach length (137 m
 campaign file vs. 135 m in `events`) — these four were flagged
 discrepancies in the last handoff and were never confirmed re-checked.
 
-**5.2 RA 2023-09-06 sample 25 — PHREEQC convergence failure.** The
-`nrow(activities) == 211` run leaves one row (`RA 20230906 25`) with
-`NA` `a_PO4`/`a_HPO4`/`a_H2PO4` — PHREEQC failed to converge for that
-solution. Not investigated; low priority since `p_coprec_ugL` is
-correctly `NA` there and the row is excluded by the existing
-`!is.na(p_coprec_ugL)` filters, not silently dropped.
+**5.2 RESOLVED — RA 2023-09-06 sample 25 (SRP): the "PHREEQC convergence
+failure" was a missing lab value, not a numerical failure.**
+`measured_SRP_ug_L` for this one grab (`sample_btc == 25`, t=6780s since
+addition, falling limb of RA_20230906_P) is blank in
+`nutrient_addition_phosphate_data.csv` -- the SRP lab measurement is
+simply missing for this sample (the neighbouring grabs, samples 22-24,
+all have valid SRP: 11.86, 11.75, 6.78 ug/L). Because `srp_molL` is `NA`
+for this row, `make_solution()`'s `add()` helper
+(`if (!is.na(value)) lines <<- c(...)`) never writes a `P` line into
+this sample's PHREEQC `SOLUTION` block -- PHREEQC is simply never given
+any phosphorus to speciate for this one solution, so the resulting
+`a_PO4`/`a_HPO4`/`a_H2PO4` `NA`s are the expected consequence of a
+missing input, not an equilibrium/convergence failure. No code change
+needed: the existing `p_coprec_ugL`/`conc_corr_coprec_ugL` handling
+already produces `NA` correctly for just this one row and excludes it
+via the standard `!is.na()` filters -- confirmed directly against
+`master_tsm.csv`: all 21 other SRP grabs for RA_20230906_P (samples
+3-24, t=720-6300s) have complete `conc_corr_ugL` and
+`conc_corr_coprec_ugL` values. RA_20230906_P has a full, usable raw- and
+coprec-corrected SRP series; only this one falling-limb point is
+missing, same as any other single missing grab.
 
 **5.3 RS 2023-10-11 PHREEQC guard warning.** `ph`/`temp_c` for the
 downstream sample are within the guard's 0.02/0.2 thresholds of the

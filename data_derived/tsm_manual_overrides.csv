@@ -1,0 +1,3 @@
+timestamp,event_id,stage,solute,conc_col,conservative_source,excluded_times,n_cells,n_lhs,D_m2s,alpha_1s,As_m2,lambda_1s,lambda_s_1s,rmse,n_gap_filled,gap_fill_dt_s,notes
+2026-08-27 11:57:14.0661,CB_20230907_single,hydraulics,NA,NA,logger,64;34;154;184,80,250,0.0121046663830757,0.000606034243084249,0.772982450104605,NA,NA,0.431965713675695,0,NA,accepted via app_tsm_review
+2026-08-27 12:26:28.871972,CB_20231008_single,hydraulics,NA,NA,logger,,95,250,9.9678966315866e-05,0.000603962101366505,0.899040568280009,NA,NA,0.341799595945168,0,NA,accepted via app_tsm_review

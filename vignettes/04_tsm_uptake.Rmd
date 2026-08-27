@@ -18,38 +18,11 @@ source(here("R", "run_tsm_uptake.R"))
 
 ## What this does
 
-This vignette estimates, for every slug event in the pipeline, how much of
-the added nitrogen (NH4-N) and phosphorus (SRP) is taken up in the reach, and
-splits that uptake between the **main channel** (attributed to biotic
-assimilation -- periphyton / water-column processes) and the **transient
-storage zone** (attributed to hyporheic/microbial and, for SRP, abiotic
-processes). It replaces OTIS-P with a direct numerical implementation of the
-same transient-storage model (Bencala & Walters 1983; Runkel 1998, OTIS) in
-R (`deSolve`), calibrated in two stages (Runkel 2007) and partitioned by the
-same four-simulation mass-balance procedure Runkel (2007) uses for OTIS
-output. See the header comments of `R/tsm_model.R`, `R/tsm_calibrate.R`, and
-`R/tsm_partition.R` for the full methodology and the equations used.
+This vignette estimates, for every slug event in the pipeline, how much of the added nitrogen (NH4-N) and phosphorus (SRP) is taken up in the reach, and splits that uptake between the **main channel** (attributed to biotic assimilation -- periphyton / water-column processes) and the **transient storage zone** (attributed to hyporheic/microbial and, for SRP, abiotic processes). It replaces OTIS-P with a direct numerical implementation of the same transient-storage model (Bencala & Walters 1983; Runkel 1998, OTIS) in R (`deSolve`), calibrated in two stages (Runkel 2007) and partitioned by the same four-simulation mass-balance procedure Runkel (2007) uses for OTIS output. See the header comments of `R/tsm_model.R`, `R/tsm_calibrate.R`, and `R/tsm_partition.R` for the full methodology and the equations used.
 
-In one sentence: **Stage 1** fits dispersion (D), the channel/storage
-exchange rate (alpha), and the storage-zone area (As) to the dense NaCl
-logger curve, with discharge/velocity/area held fixed at the pipeline's own
-independently-gauged values; **Stage 2** then fixes those and fits two
-first-order removal coefficients -- lambda (channel) and lambda_s (storage
-zone) -- to the sparser nutrient grabs; and the **partition step** runs four
-what-if simulations (conservative / fully reactive / channel-only /
-storage-only) to work out what fraction of the removed mass is attributable
-to each compartment (Runkel 2007).
+In one sentence: **Stage 1** fits dispersion (D), the channel/storage exchange rate (alpha), and the storage-zone area (As) to the dense NaCl logger curve, with discharge/velocity/area held fixed at the pipeline's own independently-gauged values; **Stage 2** then fixes those and fits two first-order removal coefficients -- lambda (channel) and lambda_s (storage zone) -- to the sparser nutrient grabs; and the **partition step** runs four what-if simulations (conservative / fully reactive / channel-only / storage-only) to work out what fraction of the removed mass is attributable to each compartment (Runkel 2007).
 
-For SRP, the pipeline additionally provides `conc_corr_coprec_ugL`, the
-series with the House (1990) CaCO3 co-precipitation correction added back
-in. Running the same procedure on that series instead of the raw
-background-corrected one approximates the **biotic-only** assimilation,
-net of the abiotic co-precipitation captured by that correction -- this is
-run automatically as a second `correction` value in the output table.
-**Carry forward the circularity caveat from the project handoff (Section
-4.6/7): do not use agreement between the coprec-corrected uptake numbers and
-delta-Ca as confirmation of the co-precipitation mechanism, since the
-correction is a deterministic function of delta-Ca.**
+For SRP, the pipeline additionally provides `conc_corr_coprec_ugL`, the series with the House (1990) CaCO3 co-precipitation correction added back in. Running the same procedure on that series instead of the raw background-corrected one approximates the **biotic-only** assimilation, net of the abiotic co-precipitation captured by that correction -- this is run automatically as a second `correction` value in the output table. **Carry forward the circularity caveat from the project handoff (Section 4.6/7): do not use agreement between the coprec-corrected uptake numbers and delta-Ca as confirmation of the co-precipitation mechanism, since the correction is a deterministic function of delta-Ca.**
 
 ## Run the batch pipeline
 
@@ -65,28 +38,11 @@ summary_tbl %>%
 
 ### Reading the output table
 
-- `fit_status`: `"ok"`, or a reason the event/solute was skipped
-  (`too_few_grabs`, `no_addition_record`, `uptake_fit_failed`).
-- `pct_total_uptake`: percent of the injected nutrient mass removed within
-  the reach (main channel + storage zone combined), from simulations A and B.
-- `pct_mainchannel` / `pct_storagezone`: the Runkel (2007) partition of that
-  total uptake, renormalised to sum to 100. **`NA` when `uptake_significant`
-  is `FALSE`** (total uptake below 2%, i.e. lambda and lambda_s are both
-  indistinguishable from zero given this BTC) -- the split of a
-  near-nonexistent removal is not meaningful and is deliberately withheld
-  rather than reported as a spurious percentage.
-- `lambda_at_bound` / `lambda_s_at_bound`: `TRUE` when the fitted coefficient
-  sits at (or within 5% in log10 space of) the search bound -- a classic
-  sign that this particular coefficient is not well identified by this BTC
-  (Bonanno et al. 2022). This does **not** necessarily mean the fit is bad
-  (see the CB 2023-09-07 example below, where lambda pins near zero while
-  lambda_s is clearly, independently identifiable) -- always check the
-  identifiability plot (next section) before trusting a specific number.
-- `Sw_total_m`, `Sw_mainchannel_m`, `vf_*`, `U_*`: the standard nutrient
-  spiralling metrics (Stream Solute Workshop 1990; Runkel 2007), reported
-  both as a single whole-reach aggregate (`_total`, comparable to a
-  conventional Sw obtained by linear regression on steady-state data) and
-  separately for the two compartments.
+-   `fit_status`: `"ok"`, or a reason the event/solute was skipped (`too_few_grabs`, `no_addition_record`, `uptake_fit_failed`).
+-   `pct_total_uptake`: percent of the injected nutrient mass removed within the reach (main channel + storage zone combined), from simulations A and B.
+-   `pct_mainchannel` / `pct_storagezone`: the Runkel (2007) partition of that total uptake, renormalised to sum to 100. **`NA` when `uptake_significant` is `FALSE`** (total uptake below 2%, i.e. lambda and lambda_s are both indistinguishable from zero given this BTC) -- the split of a near-nonexistent removal is not meaningful and is deliberately withheld rather than reported as a spurious percentage.
+-   `lambda_at_bound` / `lambda_s_at_bound`: `TRUE` when the fitted coefficient sits at (or within 5% in log10 space of) the search bound -- a classic sign that this particular coefficient is not well identified by this BTC (Bonanno et al. 2022). This does **not** necessarily mean the fit is bad (see the CB 2023-09-07 example below, where lambda pins near zero while lambda_s is clearly, independently identifiable) -- always check the identifiability plot (next section) before trusting a specific number.
+-   `Sw_total_m`, `Sw_mainchannel_m`, `vf_*`, `U_*`: the standard nutrient spiralling metrics (Stream Solute Workshop 1990; Runkel 2007), reported both as a single whole-reach aggregate (`_total`, comparable to a conventional Sw obtained by linear regression on steady-state data) and separately for the two compartments.
 
 ```{r load-tables}
 ev  <- read_csv(here::here("data_derived", "events.csv"))
@@ -97,11 +53,7 @@ hyd <- attr(summary_tbl, "hydraulic_fits")
 
 ## See every fit (all streams, all solutes)
 
-The two functions below print one figure per event (hydraulics) or per
-event x solute x correction (uptake) -- 13 + 27 = 40 figures in total. Use
-these for the actual quality-control pass across the whole dataset; the
-curated pair of examples in the next section is just there to explain how
-to *read* one.
+The two functions below print one figure per event (hydraulics) or per event x solute x correction (uptake) -- 13 + 27 = 40 figures in total. Use these for the actual quality-control pass across the whole dataset; the curated pair of examples in the next section is just there to explain how to *read* one.
 
 ```{r all-hydraulic-fits, fig.height=4}
 plot_all_hydraulic_fits(hyd, ev, btc, mtsm, n_cells = 40)
@@ -113,29 +65,14 @@ plot_all_uptake_fits(summary_tbl, hyd, mtsm, n_cells = 40)
 
 ## Case-by-case curation: `R/app_tsm_review.R`
 
-Looking at all 40 fits above usually turns up event-specific problems that a
-single batch run cannot fix on its own: a sparse rising limb, a salt curve
-that won't converge, a nutrient outlier that looks like a field/lab error, or
-(as happened for the RA slugs) a conservative-tracer source that shouldn't be
-trusted for that particular event. Rather than hand-tuning the batch script
-per event, use the companion Shiny app for an interactive, event-by-event
-pass:
+Looking at all 40 fits above usually turns up event-specific problems that a single batch run cannot fix on its own: a sparse rising limb, a salt curve that won't converge, a nutrient outlier that looks like a field/lab error, or (as happened for the RA slugs) a conservative-tracer source that shouldn't be trusted for that particular event. Rather than hand-tuning the batch script per event, use the companion Shiny app for an interactive, event-by-event pass:
 
-```r
+``` r
 # once per machine: install.packages(c("shiny", "DT"))
 shiny::runApp(here::here("R", "app_tsm_review.R"))
 ```
 
-For each event: pick the conservative-tracer source and exclude any bad
-points on the Hydraulics tab, refit, and Accept once the fit and the
-identifiability plot look right; then do the same for each solute on the
-Uptake tab (this needs the hydraulics accepted first). Every Accept appends
-one row to `data_derived/tsm_manual_overrides.csv`, recording exactly what
-was overridden (source, excluded timestamps, resulting parameters, RMSE, a
-timestamp) -- nothing is changed silently, matching this project's own QAQC
-convention. Treat the batch run above as the fast first pass across all
-streams, and this app's curated results as the authoritative ones for the
-manuscript.
+For each event: pick the conservative-tracer source and exclude any bad points on the Hydraulics tab, refit, and Accept once the fit and the identifiability plot look right; then do the same for each solute on the Uptake tab (this needs the hydraulics accepted first). Every Accept appends one row to `data_derived/tsm_manual_overrides.csv`, recording exactly what was overridden (source, excluded timestamps, resulting parameters, RMSE, a timestamp) -- nothing is changed silently, matching this project's own QAQC convention. Treat the batch run above as the fast first pass across all streams, and this app's curated results as the authoritative ones for the manuscript.
 
 ## Diagnostics: always look at the fit before trusting the numbers
 
@@ -154,9 +91,7 @@ plot_event_fit <- function(eid, solute, hyd_fit) {
 plot_event_fit("CD_20231009_single", "NH4-N", hyd[["CD_20231009_single"]])
 ```
 
-Every event's hydraulic identifiability scan is available via
-`hyd[[event_id]]$lhs` (columns `D`, `alpha`, `As_ratio`, all in log10 units,
-plus `rmse`) for a Bonanno-style parameter-vs-RMSE plot:
+Every event's hydraulic identifiability scan is available via `hyd[[event_id]]$lhs` (columns `D`, `alpha`, `As_ratio`, all in log10 units, plus `rmse`) for a Bonanno-style parameter-vs-RMSE plot:
 
 ```{r identifiability-example}
 plot_identifiability(hyd[["CD_20231009_single"]]$lhs, "alpha", xlab = "alpha (1/s)")
@@ -164,42 +99,8 @@ plot_identifiability(hyd[["CD_20231009_single"]]$lhs, "alpha", xlab = "alpha (1/
 
 ## Notes and known limitations
 
-- **Pre-arrival gap fill (grab-based series only).** Hand-held-probe NaCl
-  grabs and all nutrient grabs are only logged once the signal is seen to
-  change in the field -- if the reading hasn't moved, nothing is written
-  down. That leaves a real, physically-justified stretch between t=0
-  (release) and the first logged point where the true background-corrected
-  concentration was ~0 throughout (unlogged constancy, not missing data).
-  `fit_all_hydraulics()` (probe-sourced events only) and `run_one_uptake()`
-  (always, since nutrient grabs are never logger-based) fill that stretch
-  with synthetic zero points at the curve's own sampling interval before
-  fitting -- see `fill_pre_arrival_gap()` in `tsm_calibrate.R` for the full
-  rationale, and the number of points added is reported in the output as
-  `n_gap_filled_hydraulics`/`n_gap_filled_uptake` (never silent). The
-  `plot_all_*_fits()` functions and the Shiny app draw these as hollow red
-  points, distinct from the real (solid grey) observations, so the
-  assumption is always visible, not just documented. Set `fill_pre_arrival
-  = FALSE` in `fit_all_hydraulics()`/`run_one_uptake()`, or untick the
-  checkbox in the app, to disable it for a specific event if this
-  assumption looks wrong there.
-- **Numerical dispersion.** The finite-volume advection scheme is first-order
-  upwind, which carries some numerical dispersion (approximately v*dx/2).
-  Increase `n_cells` in `run_tsm_uptake_all()` and re-check that the fitted D
-  does not change materially if this matters for a specific reach.
-- **SR_20231011_single has no logger.** Per Kauan's own instruction, its
-  transient-storage hydraulics (D, alpha, As/A) are borrowed from
-  `SR_20231009_downstream` (same 72 m reach, two days earlier), but its own
-  discharge and grabs are used for everything else -- flagged in the output
-  as `hydraulics_borrowed_from`.
-- **This is a fast, practical identifiability check, not the full Bonanno et
-  al. (2022) iterative DYNIA procedure.** The global LHS scan (250 draws by
-  default) plus local refinement is enough to catch gross non-identifiability
-  and boundary solutions (see the diagnostics above), but is not an
-  exhaustive dynamic/segment-wise identifiability analysis. Treat
-  `lambda_at_bound`/`lambda_s_at_bound` as a prompt to look at the plot, not
-  as a final verdict.
-- Injected elemental N/P mass is read directly from
-  `data/nutrients/nutrient_addition_{nitrogen,phosphate}_data.csv`
-  (`added_mass_NH4Cl_g`/`molar_mass_NH4Cl_nutrient` and
-  `added_mass_PO4_g`/`molar_mass_P_nutrient`), matching exactly the
-  conversion `02_integration.Rmd` already uses for P.
+-   **Pre-arrival gap fill (grab-based series only).** Hand-held-probe NaCl grabs and all nutrient grabs are only logged once the signal is seen to change in the field -- if the reading hasn't moved, nothing is written down. That leaves a real, physically-justified stretch between t=0 (release) and the first logged point where the true background-corrected concentration was \~0 throughout (unlogged constancy, not missing data). `fit_all_hydraulics()` (probe-sourced events only) and `run_one_uptake()` (always, since nutrient grabs are never logger-based) fill that stretch with synthetic zero points at the curve's own sampling interval before fitting -- see `fill_pre_arrival_gap()` in `tsm_calibrate.R` for the full rationale, and the number of points added is reported in the output as `n_gap_filled_hydraulics`/`n_gap_filled_uptake` (never silent). The `plot_all_*_fits()` functions and the Shiny app draw these as hollow red points, distinct from the real (solid grey) observations, so the assumption is always visible, not just documented. Set `fill_pre_arrival   = FALSE` in `fit_all_hydraulics()`/`run_one_uptake()`, or untick the checkbox in the app, to disable it for a specific event if this assumption looks wrong there.
+-   **Numerical dispersion.** The finite-volume advection scheme is first-order upwind, which carries some numerical dispersion (approximately v\*dx/2). Increase `n_cells` in `run_tsm_uptake_all()` and re-check that the fitted D does not change materially if this matters for a specific reach.
+-   **SR_20231011_single has no logger.** Per Kauan's own instruction, its transient-storage hydraulics (D, alpha, As/A) are borrowed from `SR_20231009_downstream` (same 72 m reach, two days earlier), but its own discharge and grabs are used for everything else -- flagged in the output as `hydraulics_borrowed_from`.
+-   **This is a fast, practical identifiability check, not the full Bonanno et al. (2022) iterative DYNIA procedure.** The global LHS scan (250 draws by default) plus local refinement is enough to catch gross non-identifiability and boundary solutions (see the diagnostics above), but is not an exhaustive dynamic/segment-wise identifiability analysis. Treat `lambda_at_bound`/`lambda_s_at_bound` as a prompt to look at the plot, not as a final verdict.
+-   Injected elemental N/P mass is read directly from `data/nutrients/nutrient_addition_{nitrogen,phosphate}_data.csv` (`added_mass_NH4Cl_g`/`molar_mass_NH4Cl_nutrient` and `added_mass_PO4_g`/`molar_mass_P_nutrient`), matching exactly the conversion `02_integration.Rmd` already uses for P.
