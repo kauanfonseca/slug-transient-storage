@@ -1,0 +1,42 @@
+column,unit,description
+event_id,-,Event key; joins events/btc_conservative/master_tsm
+stream,-,Stream code
+solute,-,NH4-N or SRP
+conc_col,-,"master_tsm concentration column fit: conc_corr_ugL (raw) or conc_corr_coprec_ugL (SRP only, House 1990 co-precipitation added back in -- approximates biotic-only assimilation)"
+fit_status,-,"ok, or a reason the event/solute was skipped: too_few_grabs / no_addition_record / uptake_fit_failed"
+n_grabs,-,Number of real (non-gap-filled) nutrient grabs used in Stage 2, after any manual exclusion
+mass_injected_mg,mg,Elemental N or P mass injected; from nutrient_addition_{nitrogen,phosphate}_data.csv via the salt's molar mass
+background_ugL,ug/L,Mean ambient (pre-release) nutrient concentration for this event/solute; used as Camb in the U = vf*Camb metrics
+n_gap_filled_uptake,-,"Synthetic pre-arrival background points (concentration=0) added before the first real nutrient grab, at that curve's own sampling interval -- see fill_pre_arrival_gap(), R/tsm_calibrate.R. 0 = no gap filled (series already started at/near t=0)"
+gap_fill_dt_uptake_s,s,Sampling interval used for the uptake-stage gap fill (median spacing of the real nutrient grabs); NA when n_gap_filled_uptake is 0
+n_gap_filled_hydraulics,-,Same gap-fill count as above but for the Stage-1 conservative-tracer (NaCl) series used to fit this event's hydraulics (only non-zero for probe-sourced events); NA if that event's hydraulics were borrowed (see hydraulics_borrowed_from)
+D_m2s,m2/s,Stage-1 fitted longitudinal dispersion coefficient
+alpha_1s,1/s,Stage-1 fitted main-channel <-> storage-zone exchange coefficient
+As_m2,m2,Stage-1 fitted storage-zone cross-sectional area
+A_m2,m2,Main-channel cross-sectional area (Q/water_velocity_ms from events.csv; not fitted)
+As_over_A,-,As_m2 / A_m2 -- relative size of the storage zone vs. the main channel
+hydraulic_rmse,-,"Stage-1 fit RMSE, on sqrt-transformed concentration (see the RMSE note below); NA for borrowed hydraulics"
+lambda_1s,1/s,Stage-2 fitted main-channel first-order uptake coefficient
+lambda_s_1s,1/s,Stage-2 fitted storage-zone first-order uptake coefficient
+uptake_rmse,-,"Stage-2 fit RMSE, on sqrt-transformed concentration -- comparable only across fits on the SAME observed series (same event/solute/conc_col/exclusions); not comparable across different conservative-tracer sources or different exclusion sets"
+pct_total_uptake,%,"Runkel (2007) mass-balance: percent of the injected mass removed within the reach (main channel + storage zone combined)"
+pct_mainchannel,%,"Share of pct_total_uptake attributed to the main channel (biotic assimilation), renormalised to sum to 100 with pct_storagezone. NA when uptake_significant is FALSE"
+pct_storagezone,%,"Share of pct_total_uptake attributed to the transient-storage zone (hyporheic/microbial, or abiotic co-precipitation for raw SRP). NA when uptake_significant is FALSE"
+Sw_mainchannel_m,m,Main-channel uptake length (v/lambda). NA when lambda_at_bound is TRUE (not identifiable)
+vf_mainchannel_mps,m/s,Main-channel uptake velocity (lambda * main-channel depth)
+U_mainchannel_mgm2h,mg/m2/h,Main-channel areal uptake rate (vf_mainchannel * background_ugL; 1 ug/L == 1 mg/m3, see code comment in R/run_tsm_uptake.R)
+vf_storagezone_mps,m/s,Storage-zone uptake velocity (lambda_s * storage-zone bookkeeping depth As/width)
+U_storagezone_mgm2h,mg/m2/h,Storage-zone areal uptake rate
+Sw_total_m,m,"Whole-reach aggregate uptake length (Runkel 2007 eq 12/18), comparable to a conventional Sw from linear regression on steady-state data. NA when uptake_significant is FALSE"
+vf_total_mps,m/s,Whole-reach aggregate uptake velocity
+U_total_mgm2h,mg/m2/h,Whole-reach aggregate areal uptake rate
+lambda_at_bound,-,"TRUE when the fitted lambda sits at/near the search bound (1e-7 to 1e-1 1/s) -- sign of a non-identifiable or boundary solution (Bonanno et al. 2022); check the identifiability plot before trusting Sw_mainchannel_m"
+lambda_s_at_bound,-,Same as lambda_at_bound but for lambda_s
+uptake_significant,-,"TRUE when pct_total_uptake > 2% -- below that, splitting a near-nonexistent removal into channel/storage shares is not meaningful, so pct_mainchannel/pct_storagezone/Sw_total_m are withheld (NA) rather than reported as noise"
+correction,-,"raw (conc_corr_ugL) or coprec_corrected_biotic_only (SRP on conc_corr_coprec_ugL). See the circularity caveat in handoff.md before using coprec-corrected numbers to argue anything about the co-precipitation mechanism itself"
+hydraulics_borrowed_from,-,"event_id whose Stage-1 hydraulics (D/alpha/As-per-area) were reused for this event, because this event has no usable conservative-tracer series of its own. Currently only SR_20231011_single, borrowing from SR_20231009_downstream. NA otherwise"
+flag_discharge_invalid,-,Passed through from events.csv
+flag_mixing_incomplete,-,Passed through from events.csv
+flag_no_baseline,-,Passed through from events.csv
+flag_weak_signal,-,Passed through from events.csv
+flag_broken_pairing,-,Passed through from master_tsm.csv (see dict_master_tsm.csv)

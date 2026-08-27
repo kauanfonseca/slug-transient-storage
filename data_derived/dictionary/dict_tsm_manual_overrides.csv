@@ -1,0 +1,19 @@
+column,unit,description
+timestamp,-,"When the decision was accepted in R/app_tsm_review.R (system time, no fixed timezone recorded)"
+event_id,-,Event key
+stage,-,hydraulics or uptake -- which fitting stage this row's Accept click was for
+solute,-,NH4-N or SRP; NA for a hydraulics-stage row (hydraulics is fit once per event, not per solute)
+conc_col,-,conc_corr_ugL or conc_corr_coprec_ugL; NA for a hydraulics-stage row
+conservative_source,-,"logger or probe_grab -- which conservative-tracer series the accepted hydraulics fit used (uptake-stage rows carry the source of the hydraulics they depend on, for traceability)"
+excluded_times,-,"time_since_release_s values (semicolon-separated) manually excluded before this fit, e.g. a field/lab error identified during review. Empty = no exclusions"
+n_cells,-,Finite-volume spatial resolution used for this accepted fit
+n_lhs,-,Number of global Latin Hypercube Sample draws used for this accepted fit
+D_m2s,m2/s,Accepted (hydraulics stage) or inherited (uptake stage) Stage-1 dispersion coefficient
+alpha_1s,1/s,Accepted/inherited Stage-1 exchange coefficient
+As_m2,m2,Accepted/inherited Stage-1 storage-zone area
+lambda_1s,1/s,Accepted Stage-2 main-channel uptake coefficient; NA for a hydraulics-stage row
+lambda_s_1s,1/s,Accepted Stage-2 storage-zone uptake coefficient; NA for a hydraulics-stage row
+rmse,-,"Fit RMSE (sqrt-transformed concentration scale) at accept time -- comparable only to another row fit on the exact same observed series; see the RMSE note in dict_tsm_uptake_summary.csv"
+n_gap_filled,-,Synthetic pre-arrival background points added before fitting (0 if the gap-fill checkbox was off or there was no gap to fill)
+gap_fill_dt_s,s,Sampling interval used for that gap fill; NA when n_gap_filled is 0
+notes,-,"Free-text; currently always ""accepted via app_tsm_review"" -- edit this file directly to add a specific reason for a given decision if useful for a collaborator picking this up later"
