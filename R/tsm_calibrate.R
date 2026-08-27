@@ -70,6 +70,53 @@ thin_series <- function(time, value, n_max = 200) {
   data.frame(time = time[idx], value = value[idx])
 }
 
+#' Fill the "pre-arrival" gap in a sparse grab/probe series with synthetic
+#' background points, at the same sampling interval used later in that curve.
+#'
+#' Field rationale (Kauan): monitoring starts at the moment of tracer
+#' release, but a hand-held-probe or nutrient grab is only WRITTEN DOWN once
+#' the signal is seen to change -- if the reading hasn't moved, there is
+#' nothing new to log. So every grab-based series (hand-held-probe NaCl
+#' grabs, nutrient grabs -- NOT the continuously-auto-logging conductivity
+#' logger, which records regardless of whether the value moved) has a real,
+#' physically-justified stretch between t=0 (release) and the first logged
+#' point during which the true background-corrected concentration was ~0
+#' throughout. That stretch is not missing data -- it is unlogged constancy.
+#' Leaving it empty starves the model of exactly the "nothing happened yet"
+#' information the dense logger curves get for free, which was making sparse
+#' grab-based fits needlessly sensitive to wherever the first grab happened
+#' to land (this is what motivated the fix -- see the comment in
+#' simulate_tsm(), tsm_model.R, for the separate but related time-alignment
+#' bug found via the same review).
+#'
+#' @param time,value observed time (s, sorted ascending, deduplicated) and
+#'   concentration (already background-corrected, so "no signal yet" == 0)
+#' @param dt sampling interval (s) used for the synthetic fill points; if
+#'   NULL, uses the median spacing of the observed series itself -- i.e.
+#'   "this curve's own sampling frequency", per Kauan's instruction, rather
+#'   than a single interval assumed across all events
+#' @param min_gap_factor only fill when the first observed time is more than
+#'   this many multiples of dt after t=0, so a series that already starts
+#'   right at release doesn't get one redundant synthetic point
+#' @return list(time, value, kind, n_added, dt_used). `kind` is a parallel
+#'   character vector ("gap_fill" / "observed") for plotting/auditing which
+#'   points are real vs. assumed; n_added/dt_used record what was assumed so
+#'   callers can report it rather than silently changing the series.
+fill_pre_arrival_gap <- function(time, value, dt = NULL, min_gap_factor = 1.5) {
+  kind_obs <- rep("observed", length(time))
+  if (length(time) < 2 || is.na(time[1]) || time[1] <= 0) {
+    return(list(time = time, value = value, kind = kind_obs, n_added = 0L, dt_used = NA_real_))
+  }
+  if (is.null(dt)) dt <- stats::median(diff(time))
+  if (!is.finite(dt) || dt <= 0 || time[1] < min_gap_factor * dt) {
+    return(list(time = time, value = value, kind = kind_obs, n_added = 0L, dt_used = dt))
+  }
+  fill_times <- seq(0, time[1] - dt, by = dt)
+  list(time = c(fill_times, time), value = c(rep(0, length(fill_times)), value),
+       kind = c(rep("gap_fill", length(fill_times)), kind_obs),
+       n_added = length(fill_times), dt_used = dt)
+}
+
 #' Stage 1 -- fit D, alpha, As to a conservative-tracer breakthrough curve
 #'
 #' @param obs_time,obs_conc observed time (s) and background-corrected

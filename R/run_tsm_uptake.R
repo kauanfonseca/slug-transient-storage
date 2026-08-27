@@ -74,7 +74,8 @@ HYDRAULICS_BORROWED_FROM <- c(SR_20231011_single = "SR_20231009_downstream")
 #' logger-based events -- that is a real data-density limitation carried
 #' over from the field measurement, not a fitting bug.
 fit_all_hydraulics <- function(events, btc_conservative, master_tsm,
-                                n_lhs = 250, n_cells = 40, seed = 1) {
+                                n_lhs = 250, n_cells = 40, seed = 1,
+                                fill_pre_arrival = TRUE) {
   set.seed(seed)
   ids <- events %>%
     filter(!isTRUE(flag_discharge_invalid), !is.na(discharge_Ls),
@@ -106,8 +107,20 @@ fit_all_hydraulics <- function(events, btc_conservative, master_tsm,
     A <- Q / e$water_velocity_ms
     mass_g <- e$nacl_mass_g
 
+    # Pre-arrival gap fill: only for the hand-held-probe grabs, never the
+    # auto-logging conductivity logger (which records continuously
+    # regardless of whether the signal moved, so has no such gap to fill --
+    # see fill_pre_arrival_gap(), tsm_calibrate.R, for the field rationale).
+    obs_conc <- pmax(sub$nacl_mgL, 0)
+    gf <- if (use_probe && fill_pre_arrival) {
+      fill_pre_arrival_gap(sub$time_since_release_s, obs_conc)
+    } else {
+      list(time = sub$time_since_release_s, value = obs_conc,
+           kind = rep("observed", nrow(sub)), n_added = 0L, dt_used = NA_real_)
+    }
+
     fit <- tryCatch(
-      fit_hydraulics(sub$time_since_release_s, pmax(sub$nacl_mgL, 0), L, Q, A,
+      fit_hydraulics(gf$time, gf$value, L, Q, A,
                       mass_g, n_lhs = n_lhs, n_cells = n_cells),
       error = function(err) NULL
     )
@@ -116,7 +129,8 @@ fit_all_hydraulics <- function(events, btc_conservative, master_tsm,
     list(event_id = eid, L = L, Q = Q, A = A, v = Q / A,
          width = e$reach_mean_width_m, D = fit$par[["D"]],
          alpha = fit$par[["alpha"]], As = fit$par[["As"]], rmse = fit$rmse,
-         lhs = fit$lhs, conservative_source = source_used)
+         lhs = fit$lhs, conservative_source = source_used,
+         n_gap_filled = gf$n_added, gap_fill_dt_s = gf$dt_used)
   })
   names(results) <- ids
   results[!vapply(results, is.null, logical(1))]
@@ -145,7 +159,7 @@ lookup_injected_mass_mg <- function(events_row, nitrogen_raw, phosphate_raw, sol
 #' x concentration-column combination.
 run_one_uptake <- function(event_id, solute, conc_col, hyd, events, master_tsm,
                             nitrogen_raw, phosphate_raw, n_lhs = 250, n_cells = 40,
-                            excluded_times = NULL) {
+                            excluded_times = NULL, fill_pre_arrival = TRUE) {
 
   e <- events %>% filter(event_id == !!event_id)
   nut <- master_tsm %>%
@@ -174,8 +188,19 @@ run_one_uptake <- function(event_id, solute, conc_col, hyd, events, master_tsm,
   hydraulics <- c(D = hyd$D, alpha = hyd$alpha, As = hyd$As)
 
   obs_conc <- pmax(nut[[conc_col]], 0)
+  # Nutrient grabs are always sparse, hand-taken samples (never the
+  # continuous logger), so the same pre-arrival gap fill Kauan described for
+  # the hand-held-probe NaCl grabs applies here by default -- see
+  # fill_pre_arrival_gap(), tsm_calibrate.R.
+  gf <- if (fill_pre_arrival) {
+    fill_pre_arrival_gap(nut$time_since_release_s, obs_conc)
+  } else {
+    list(time = nut$time_since_release_s, value = obs_conc,
+         kind = rep("observed", nrow(nut)), n_added = 0L, dt_used = NA_real_)
+  }
+
   fitU <- tryCatch(
-    fit_uptake(nut$time_since_release_s, obs_conc, L, Q, A, hydraulics, mass_mg,
+    fit_uptake(gf$time, gf$value, L, Q, A, hydraulics, mass_mg,
                n_lhs = n_lhs, n_cells = n_cells),
     error = function(err) NULL
   )
@@ -219,6 +244,8 @@ run_one_uptake <- function(event_id, solute, conc_col, hyd, events, master_tsm,
     event_id = event_id, solute = solute, conc_col = conc_col,
     fit_status = "ok", n_grabs = nrow(nut), mass_injected_mg = mass_mg,
     background_ugL = Camb,
+    n_gap_filled_uptake = gf$n_added, gap_fill_dt_uptake_s = gf$dt_used,
+    n_gap_filled_hydraulics = if (!is.null(hyd$n_gap_filled)) hyd$n_gap_filled else NA_integer_,
     D_m2s = hyd$D, alpha_1s = hyd$alpha, As_m2 = hyd$As, A_m2 = A,
     As_over_A = hyd$As / A, hydraulic_rmse = hyd$rmse,
     lambda_1s = fitU$par[["lambda"]], lambda_s_1s = fitU$par[["lambda_s"]],

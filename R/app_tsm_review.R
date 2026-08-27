@@ -80,7 +80,7 @@ EVENT_IDS <- sort(unique(events$event_id))
 OVERRIDE_COLS <- c("timestamp", "event_id", "stage", "solute", "conc_col",
                     "conservative_source", "excluded_times", "n_cells", "n_lhs",
                     "D_m2s", "alpha_1s", "As_m2", "lambda_1s", "lambda_s_1s",
-                    "rmse", "notes")
+                    "rmse", "n_gap_filled", "gap_fill_dt_s", "notes")
 
 read_overrides <- function() {
   if (file.exists(OVERRIDES_PATH)) {
@@ -159,6 +159,7 @@ ui <- fluidPage(
             column(4, numericInput("hyd_n_cells", "n_cells", value = 40, min = 10, max = 120, step = 5)),
             column(4, numericInput("hyd_n_lhs", "n_lhs", value = 250, min = 40, max = 1000, step = 10))
           ),
+          uiOutput("hyd_gap_fill_ui"),
           helpText("Selecione linhas na tabela abaixo para EXCLUIR pontos antes de reajustar",
                     "(ex.: erro de leitura, pico de conductividade espúrio)."),
           DTOutput("hyd_table"),
@@ -182,6 +183,7 @@ ui <- fluidPage(
             column(4, numericInput("up_n_cells", "n_cells", value = 40, min = 10, max = 120, step = 5))
           ),
           numericInput("up_n_lhs", "n_lhs", value = 250, min = 40, max = 1000, step = 10),
+          checkboxInput("up_fill_gap", "Preencher lacuna pré-chegada com background (recomendado)", value = TRUE),
           helpText("Requer hidráulica aceita para este evento (aba Hydraulics).",
                     "Selecione linhas na tabela para EXCLUIR outliers antes de reajustar."),
           DTOutput("up_table"),
@@ -253,6 +255,15 @@ server <- function(input, output, session) {
               options = list(pageLength = 10, order = list(list(0, "asc"))))
   })
 
+  # the pre-arrival gap fill only makes sense for the hand-held-probe grabs
+  # (the logger already records continuously, so has no such gap -- see
+  # fill_pre_arrival_gap(), tsm_calibrate.R) -- hide the toggle otherwise
+  output$hyd_gap_fill_ui <- renderUI({
+    if (identical(input$cons_source, "probe_grab")) {
+      checkboxInput("hyd_fill_gap", "Preencher lacuna pré-chegada com background (recomendado)", value = TRUE)
+    }
+  })
+
   observeEvent(input$hyd_refit, {
     df_full <- hyd_series()
     sel <- input$hyd_table_rows_selected
@@ -265,9 +276,18 @@ server <- function(input, output, session) {
     Q <- e$discharge_Ls / 1000
     A <- Q / e$water_velocity_ms
 
+    do_fill <- identical(input$cons_source, "probe_grab") && isTRUE(input$hyd_fill_gap)
+    obs_conc <- pmax(df$nacl_mgL, 0)
+    gf <- if (do_fill) {
+      fill_pre_arrival_gap(df$time_since_release_s, obs_conc)
+    } else {
+      list(time = df$time_since_release_s, value = obs_conc,
+           kind = rep("observed", nrow(df)), n_added = 0L, dt_used = NA_real_)
+    }
+
     fit <- withProgress(message = "Ajustando hidráulica...", value = 0.3, {
       out <- tryCatch(
-        fit_hydraulics(df$time_since_release_s, pmax(df$nacl_mgL, 0), L, Q, A,
+        fit_hydraulics(gf$time, gf$value, L, Q, A,
                         e$nacl_mass_g, n_lhs = input$hyd_n_lhs, n_cells = input$hyd_n_cells),
         error = function(err) NULL
       )
@@ -281,15 +301,17 @@ server <- function(input, output, session) {
                         width = e$reach_mean_width_m, D = fit$par[["D"]],
                         alpha = fit$par[["alpha"]], As = fit$par[["As"]], rmse = fit$rmse,
                         lhs = fit$lhs, conservative_source = input$cons_source,
-                        excluded_times = excluded_times, obs = df, mass_g = e$nacl_mass_g)
+                        excluded_times = excluded_times, obs = df, mass_g = e$nacl_mass_g,
+                        plot_time = gf$time, plot_conc = gf$value, plot_kind = gf$kind,
+                        n_gap_filled = gf$n_added, gap_fill_dt_s = gf$dt_used)
   })
 
   output$hyd_fit_plot <- renderPlot({
     req(rv$hyd_fit)
     h <- rv$hyd_fit
-    plot_btc_fit(h$obs$time_since_release_s, pmax(h$obs$nacl_mgL, 0),
+    plot_btc_fit(h$plot_time, h$plot_conc,
                  h$L, h$Q, h$A, h$D, h$alpha, h$As, mass = h$mass_g,
-                 n_cells = input$hyd_n_cells, unit = "mg/L",
+                 n_cells = input$hyd_n_cells, unit = "mg/L", obs_kind = h$plot_kind,
                  title = sprintf("%s -- NaCl fit (RMSE=%.3f, source=%s)", h$event_id, h$rmse, h$conservative_source))
   })
 
@@ -304,6 +326,10 @@ server <- function(input, output, session) {
     cat(sprintf("D = %.5g m2/s | alpha = %.5g 1/s | As = %.4g m2 (As/A = %.3f) | RMSE = %.4f\n",
                 h$D, h$alpha, h$As, h$As / h$A, h$rmse))
     cat(sprintf("source = %s | pontos excluídos = %d\n", h$conservative_source, length(h$excluded_times)))
+    if (h$n_gap_filled > 0) {
+      cat(sprintf("lacuna pré-chegada preenchida: %d pontos sintéticos (background=0) a cada %.0f s, de t=0 até a 1ª amostra real\n",
+                  h$n_gap_filled, h$gap_fill_dt_s))
+    }
     if (input$event_id %in% names(rv$accepted_hyd)) {
       cat("\n[ACEITA para esta sessão -- a aba Uptake vai usar este ajuste]\n")
     } else {
@@ -320,6 +346,7 @@ server <- function(input, output, session) {
       solute = NA, conc_col = NA, conservative_source = h$conservative_source,
       excluded_times = paste(h$excluded_times, collapse = ";"),
       n_cells = input$hyd_n_cells, n_lhs = input$hyd_n_lhs,
+      n_gap_filled = h$n_gap_filled, gap_fill_dt_s = h$gap_fill_dt_s,
       D_m2s = h$D, alpha_1s = h$alpha, As_m2 = h$As, lambda_1s = NA, lambda_s_1s = NA,
       rmse = h$rmse, notes = "accepted via app_tsm_review"
     ))
@@ -365,10 +392,19 @@ server <- function(input, output, session) {
     mass_mg <- lookup_injected_mass_mg(e, nitrogen_raw, phosphate_raw, input$solute)
     validate(need(is.finite(mass_mg), "Não há registro de massa injetada para este evento/soluto."))
 
+    do_fill <- isTRUE(input$up_fill_gap)
+    obs_conc <- pmax(df$conc_ugL, 0)
+    gf <- if (do_fill) {
+      fill_pre_arrival_gap(df$time_since_release_s, obs_conc)
+    } else {
+      list(time = df$time_since_release_s, value = obs_conc,
+           kind = rep("observed", nrow(df)), n_added = 0L, dt_used = NA_real_)
+    }
+
     hydraulics <- c(D = hyd$D, alpha = hyd$alpha, As = hyd$As)
     fitU <- withProgress(message = "Ajustando uptake...", value = 0.3, {
       out <- tryCatch(
-        fit_uptake(df$time_since_release_s, pmax(df$conc_ugL, 0), hyd$L, hyd$Q, hyd$A, hydraulics, mass_mg,
+        fit_uptake(gf$time, gf$value, hyd$L, hyd$Q, hyd$A, hydraulics, mass_mg,
                    n_lhs = input$up_n_lhs, n_cells = input$up_n_cells),
         error = function(err) NULL
       )
@@ -396,6 +432,8 @@ server <- function(input, output, session) {
                        lambda = fitU$par[["lambda"]], lambda_s = fitU$par[["lambda_s"]],
                        rmse = fitU$rmse, lhs = fitU$lhs, mass_mg = mass_mg,
                        excluded_times = excluded_times, obs = df, hyd = hyd,
+                       plot_time = gf$time, plot_conc = gf$value, plot_kind = gf$kind,
+                       n_gap_filled = gf$n_added, gap_fill_dt_s = gf$dt_used,
                        part = part, met = met, lambda_at_bound = lambda_at_bound,
                        lambda_s_at_bound = lambda_s_at_bound, uptake_significant = uptake_significant)
   })
@@ -403,10 +441,10 @@ server <- function(input, output, session) {
   output$up_fit_plot <- renderPlot({
     req(rv$up_fit)
     u <- rv$up_fit
-    plot_btc_fit(u$obs$time_since_release_s, pmax(u$obs$conc_ugL, 0),
+    plot_btc_fit(u$plot_time, u$plot_conc,
                  u$hyd$L, u$hyd$Q, u$hyd$A, u$hyd$D, u$hyd$alpha, u$hyd$As,
                  lambda = u$lambda, lambda_s = u$lambda_s, mass = u$mass_mg,
-                 n_cells = input$up_n_cells, unit = "ug/L",
+                 n_cells = input$up_n_cells, unit = "ug/L", obs_kind = u$plot_kind,
                  title = sprintf("%s -- %s (%s) RMSE=%.3f", u$event_id, u$solute, u$conc_col, u$rmse))
   })
 
@@ -422,7 +460,12 @@ server <- function(input, output, session) {
                 if (u$lambda_at_bound) "[NO LIMITE DA BUSCA -- checar identificabilidade]" else ""))
     cat(sprintf("lambda_s (zona de transição) = %.4g 1/s %s\n", u$lambda_s,
                 if (u$lambda_s_at_bound) "[NO LIMITE DA BUSCA -- checar identificabilidade]" else ""))
-    cat(sprintf("RMSE = %.4f | pontos excluídos = %d\n\n", u$rmse, length(u$excluded_times)))
+    cat(sprintf("RMSE = %.4f | pontos excluídos = %d\n", u$rmse, length(u$excluded_times)))
+    if (u$n_gap_filled > 0) {
+      cat(sprintf("lacuna pré-chegada preenchida: %d pontos sintéticos (background=0) a cada %.0f s\n",
+                  u$n_gap_filled, u$gap_fill_dt_s))
+    }
+    cat("\n")
     cat(sprintf("Uptake total do trecho: %.1f%%\n", u$part$pct_total_uptake))
     if (u$uptake_significant) {
       cat(sprintf("  -> canal principal: %.1f%% | zona de transição: %.1f%%\n",
@@ -451,6 +494,7 @@ server <- function(input, output, session) {
       solute = u$solute, conc_col = u$conc_col, conservative_source = u$hyd$conservative_source,
       excluded_times = paste(u$excluded_times, collapse = ";"),
       n_cells = input$up_n_cells, n_lhs = input$up_n_lhs,
+      n_gap_filled = u$n_gap_filled, gap_fill_dt_s = u$gap_fill_dt_s,
       D_m2s = u$hyd$D, alpha_1s = u$hyd$alpha, As_m2 = u$hyd$As,
       lambda_1s = u$lambda, lambda_s_1s = u$lambda_s,
       rmse = u$rmse, notes = "accepted via app_tsm_review"
