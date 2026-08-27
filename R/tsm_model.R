@@ -133,12 +133,30 @@ simulate_tsm <- function(L, Q, A = NULL, v = NULL, D, alpha, As,
   parms <- list(n = n, dx = dx, v = v, D = D, alpha = alpha,
                 A = A, As = As, lambda = lambda, lambda_s = lambda_s)
 
-  if (times[1] != 0) times <- c(0, times)
+  # deSolve's ode() requires times[1] == 0 (the initial condition time) to be
+  # part of the integration times; if the caller's own `times` doesn't start
+  # at 0 (e.g. nutrient grabs sampled starting well after the slug release,
+  # not at the release itself), a 0 is prepended here so the solver has an
+  # initial point to integrate from. That adds one extra row to `out` that
+  # does NOT correspond to any of the caller's requested times, so it must be
+  # dropped again before returning -- otherwise the returned C vector is one
+  # element longer than the caller's `times` (and than any obs vector it's
+  # about to be compared against), which for fit_hydraulics()/fit_uptake()'s
+  # cost functions silently misaligned sim vs. obs by one position via R's
+  # vector recycling instead of erroring, corrupting the RMSE for every
+  # nutrient grab series that doesn't start at time_since_release_s == 0
+  # (i.e. essentially all of them -- grabs start after the slug has already
+  # been travelling for some time). Caught via the Shiny app's testServer
+  # smoke test (a "longer object length is not a multiple of shorter object
+  # length" warning from sqrt_rmse()), not by manual inspection.
+  prepended_zero <- times[1] != 0
+  if (prepended_zero) times <- c(0, times)
 
   out <- suppressWarnings(
     ode(y = y0, times = times, func = tsm_derivs, parms = parms, method = "lsoda")
   )
   out <- as.data.frame(out)
+  if (prepended_zero) out <- out[-1, , drop = FALSE]
 
   data.frame(
     time = out$time,

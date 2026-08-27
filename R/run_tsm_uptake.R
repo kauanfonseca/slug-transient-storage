@@ -33,6 +33,7 @@ suppressPackageStartupMessages({
   library(readr)
   library(tidyr)
   library(purrr)
+  library(here)
 })
 
 M_N <- 14.007   # g/mol, elemental nitrogen
@@ -48,20 +49,57 @@ M_P <- 30.974   # g/mol, elemental phosphorus
 #' hydraulic fit.
 HYDRAULICS_BORROWED_FROM <- c(SR_20231011_single = "SR_20231009_downstream")
 
-#' Fit Stage-1 hydraulics for every event that has a usable conservative
-#' tracer logger series (has_logger == TRUE and not flag_discharge_invalid).
-fit_all_hydraulics <- function(events, btc_conservative, n_lhs = 250, n_cells = 40, seed = 1) {
+#' Fit Stage-1 hydraulics for every event that has a usable conservative-
+#' tracer series.
+#'
+#' Which series to use is not always "the logger, because has_logger is
+#' TRUE": `events$discharge_source` already records, event by event, when
+#' the pipeline itself decided the LOGGER's own conductivity curve is not
+#' trustworthy (contaminated start anchor, no clean baseline, weak signal --
+#' see the project handoff, Section 4.3/4.8) and fell back to the
+#' hand-held probe (YSI/Hanna) trapezoidal estimate instead. Kauan caught
+#' that an earlier version of this function used the logger curve for
+#' EVERY event with has_logger == TRUE regardless of that flag -- e.g.
+#' RA_20231005_downstream, whose adopted discharge_source is "probe"
+#' precisely because the logger's start anchor is contaminated, was still
+#' being hydraulically calibrated against that same untrustworthy logger
+#' curve. Fixed: whenever discharge_source == "probe", the conservative
+#' series used for calibration is the paired hand-held NaCl series instead
+#' (`nacl_mgL_grab` in master_tsm/btc_nutrients -- the same conductivity
+#' grabs taken alongside the nutrient samples, already background-corrected
+#' and converted via NACL_SLOPE in 02_integration.Rmd). This series is as
+#' sparse as the nutrient grabs themselves (~20-30 points, not the logger's
+#' ~200-1000), which is expected to make the hydraulic fit for these
+#' specific events (the RA slugs) less tightly constrained than for
+#' logger-based events -- that is a real data-density limitation carried
+#' over from the field measurement, not a fitting bug.
+fit_all_hydraulics <- function(events, btc_conservative, master_tsm,
+                                n_lhs = 250, n_cells = 40, seed = 1) {
   set.seed(seed)
   ids <- events %>%
-    filter(has_logger, !isTRUE(flag_discharge_invalid), !is.na(discharge_Ls)) %>%
+    filter(!isTRUE(flag_discharge_invalid), !is.na(discharge_Ls),
+           has_logger | discharge_source == "probe",
+           !(event_id %in% names(HYDRAULICS_BORROWED_FROM))) %>%
     pull(event_id)
 
   results <- map(ids, function(eid) {
     e <- events %>% filter(event_id == eid)
-    sub <- btc_conservative %>%
-      filter(event_id == eid, time_since_release_s >= 0) %>%
-      arrange(time_since_release_s)
-    if (nrow(sub) < 10) return(NULL)
+    use_probe <- isTRUE(e$discharge_source == "probe")
+
+    if (use_probe) {
+      sub <- master_tsm %>%
+        filter(event_id == eid, !is.na(nacl_mgL_grab), time_since_release_s >= 0) %>%
+        distinct(time_since_release_s, nacl_mgL_grab) %>%
+        arrange(time_since_release_s) %>%
+        rename(nacl_mgL = nacl_mgL_grab)
+      source_used <- "probe_grab"
+    } else {
+      sub <- btc_conservative %>%
+        filter(event_id == eid, time_since_release_s >= 0) %>%
+        arrange(time_since_release_s)
+      source_used <- "logger"
+    }
+    if (nrow(sub) < 8) return(NULL)
 
     L <- e$reach_length_m
     Q <- e$discharge_Ls / 1000
@@ -78,7 +116,7 @@ fit_all_hydraulics <- function(events, btc_conservative, n_lhs = 250, n_cells = 
     list(event_id = eid, L = L, Q = Q, A = A, v = Q / A,
          width = e$reach_mean_width_m, D = fit$par[["D"]],
          alpha = fit$par[["alpha"]], As = fit$par[["As"]], rmse = fit$rmse,
-         lhs = fit$lhs)
+         lhs = fit$lhs, conservative_source = source_used)
   })
   names(results) <- ids
   results[!vapply(results, is.null, logical(1))]
@@ -106,12 +144,21 @@ lookup_injected_mass_mg <- function(events_row, nitrogen_raw, phosphate_raw, sol
 #' Run the full Stage-2 + partition + metrics pipeline for one event x solute
 #' x concentration-column combination.
 run_one_uptake <- function(event_id, solute, conc_col, hyd, events, master_tsm,
-                            nitrogen_raw, phosphate_raw, n_lhs = 250, n_cells = 40) {
+                            nitrogen_raw, phosphate_raw, n_lhs = 250, n_cells = 40,
+                            excluded_times = NULL) {
 
   e <- events %>% filter(event_id == !!event_id)
   nut <- master_tsm %>%
     filter(event_id == !!event_id, solute == !!solute, !is.na(.data[[conc_col]])) %>%
     arrange(time_since_release_s)
+  # `excluded_times`: grab timestamps (time_since_release_s) to drop before
+  # fitting -- e.g. a value flagged as a field/lab error in the interactive
+  # review app (R/app_tsm_review.R). Never a silent default: this is always
+  # an explicit list passed in by the caller, recorded in
+  # data_derived/tsm_manual_overrides.csv when set from the app.
+  if (!is.null(excluded_times) && length(excluded_times) > 0) {
+    nut <- nut %>% filter(!time_since_release_s %in% excluded_times)
+  }
   if (nrow(nut) < 6) {
     return(tibble(event_id = event_id, solute = solute, conc_col = conc_col,
                    fit_status = "too_few_grabs"))
@@ -181,20 +228,34 @@ run_one_uptake <- function(event_id, solute, conc_col, hyd, events, master_tsm,
     pct_storagezone = if (uptake_significant) part$pct_storagezone else NA_real_,
     Sw_mainchannel_m = if (!lambda_at_bound) met$Sw_mainchannel_m else NA_real_,
     vf_mainchannel_mps = met$vf_mainchannel_mps,
-    U_mainchannel_ugm2h = met$U_mainchannel * 3600,
-    vf_storagezone_mps = met$vf_storagezone_mps, U_storagezone_ugm2h = met$U_storagezone * 3600,
+    # NOTE on units: U = vf [m/s] * Camb. Camb is read from background_ugL,
+    # i.e. numerically in ug/L -- but 1 ug/L == 1 mg/m3 (1e-6 g / 1e-3 m3 =
+    # 1e-3 g/m3 = 1 mg/m3), so vf [m/s] * Camb [numerically ug/L] already
+    # equals mg/(m2.s) without any further conversion; *3600 gives mg/(m2.h).
+    # (An earlier version of this file mislabelled these columns "_ugm2h" --
+    # same numbers, wrong unit in the name. Fixed here to "_mgm2h", the
+    # units conventionally reported in the nutrient-spiralling literature.)
+    U_mainchannel_mgm2h = met$U_mainchannel * 3600,
+    vf_storagezone_mps = met$vf_storagezone_mps, U_storagezone_mgm2h = met$U_storagezone * 3600,
     Sw_total_m = if (uptake_significant) met$Sw_total_m else NA_real_,
     vf_total_mps = met$vf_total_mps,
-    U_total_ugm2h = met$U_total * 3600,
+    U_total_mgm2h = met$U_total * 3600,
     lambda_at_bound = lambda_at_bound, lambda_s_at_bound = lambda_s_at_bound,
     uptake_significant = uptake_significant
   )
 }
 
 #' Full batch pipeline across all events and solutes
-run_tsm_uptake_all <- function(data_dir = "data_derived", nutrients_dir = "data/nutrients",
+run_tsm_uptake_all <- function(data_dir = here::here("data_derived"),
+                                nutrients_dir = here::here("data", "nutrients"),
                                 n_lhs_hydraulics = 250, n_lhs_uptake = 250, n_cells = 40,
                                 seed = 1) {
+  # `here::here()` anchors these paths to the project root (wherever the
+  # .Rproj file is), regardless of the current working directory -- this
+  # matters because knitting/running chunks from an .Rmd sets the working
+  # directory to the .Rmd's own folder (vignettes/), not the project root,
+  # so a plain relative path like "data_derived/events.csv" would fail
+  # there even though the file exists at the project root.
 
   events <- read_csv(file.path(data_dir, "events.csv"), show_col_types = FALSE)
   btc_conservative <- read_csv(file.path(data_dir, "btc_conservative.csv"), show_col_types = FALSE)
@@ -205,7 +266,7 @@ run_tsm_uptake_all <- function(data_dir = "data_derived", nutrients_dir = "data/
     mutate(date = as.character(date)) %>% distinct(stream, date, added_mass_PO4_g, molar_mass_P_nutrient)
 
   message("Stage 1 -- fitting transient-storage hydraulics on conservative (NaCl) BTCs...")
-  hyd_fits <- fit_all_hydraulics(events, btc_conservative, n_lhs = n_lhs_hydraulics,
+  hyd_fits <- fit_all_hydraulics(events, btc_conservative, master_tsm, n_lhs = n_lhs_hydraulics,
                                   n_cells = n_cells, seed = seed)
 
   # borrow hydraulics for events with no usable logger series (see
@@ -222,7 +283,7 @@ run_tsm_uptake_all <- function(data_dir = "data_derived", nutrients_dir = "data/
                                width = e$reach_mean_width_m, D = src_fit$D,
                                alpha = src_fit$alpha, As = src_fit$As / src_fit$A * A,
                                rmse = NA_real_, lhs = NULL,
-                               hydraulics_borrowed_from = src)
+                               hydraulics_borrowed_from = src, conservative_source = "borrowed")
       message(sprintf("  %s: no usable logger; hydraulics borrowed from %s", eid, src))
     }
   }

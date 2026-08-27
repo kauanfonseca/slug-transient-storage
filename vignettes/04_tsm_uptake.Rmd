@@ -88,17 +88,60 @@ summary_tbl %>%
   conventional Sw obtained by linear regression on steady-state data) and
   separately for the two compartments.
 
+```{r load-tables}
+ev  <- read_csv(here::here("data_derived", "events.csv"))
+btc <- read_csv(here::here("data_derived", "btc_conservative.csv"))
+mtsm<- read_csv(here::here("data_derived", "master_tsm.csv"))
+hyd <- attr(summary_tbl, "hydraulic_fits")
+```
+
+## See every fit (all streams, all solutes)
+
+The two functions below print one figure per event (hydraulics) or per
+event x solute x correction (uptake) -- 13 + 27 = 40 figures in total. Use
+these for the actual quality-control pass across the whole dataset; the
+curated pair of examples in the next section is just there to explain how
+to *read* one.
+
+```{r all-hydraulic-fits, fig.height=4}
+plot_all_hydraulic_fits(hyd, ev, btc, mtsm, n_cells = 40)
+```
+
+```{r all-uptake-fits, fig.height=4}
+plot_all_uptake_fits(summary_tbl, hyd, mtsm, n_cells = 40)
+```
+
+## Case-by-case curation: `R/app_tsm_review.R`
+
+Looking at all 40 fits above usually turns up event-specific problems that a
+single batch run cannot fix on its own: a sparse rising limb, a salt curve
+that won't converge, a nutrient outlier that looks like a field/lab error, or
+(as happened for the RA slugs) a conservative-tracer source that shouldn't be
+trusted for that particular event. Rather than hand-tuning the batch script
+per event, use the companion Shiny app for an interactive, event-by-event
+pass:
+
+```r
+# once per machine: install.packages(c("shiny", "DT"))
+shiny::runApp(here::here("R", "app_tsm_review.R"))
+```
+
+For each event: pick the conservative-tracer source and exclude any bad
+points on the Hydraulics tab, refit, and Accept once the fit and the
+identifiability plot look right; then do the same for each solute on the
+Uptake tab (this needs the hydraulics accepted first). Every Accept appends
+one row to `data_derived/tsm_manual_overrides.csv`, recording exactly what
+was overridden (source, excluded timestamps, resulting parameters, RMSE, a
+timestamp) -- nothing is changed silently, matching this project's own QAQC
+convention. Treat the batch run above as the fast first pass across all
+streams, and this app's curated results as the authoritative ones for the
+manuscript.
+
 ## Diagnostics: always look at the fit before trusting the numbers
 
 Two examples, contrasting a well-identified case with a boundary case.
 
 ```{r diagnostics-well-identified}
-ev  <- read_csv(here::here("data_derived", "events.csv"))
-btc <- read_csv(here::here("data_derived", "btc_conservative.csv"))
-mtsm<- read_csv(here::here("data_derived", "master_tsm.csv"))
-
-hyd <- attr(summary_tbl, "hydraulic_fits")
-
 plot_event_fit <- function(eid, solute, hyd_fit) {
   sub <- btc %>% filter(event_id == eid, time_since_release_s >= 0) %>% arrange(time_since_release_s)
   e <- ev %>% filter(event_id == eid)
