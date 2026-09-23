@@ -110,7 +110,7 @@ log_c_ade <- function(x, tau, v, D, A, mass) {
 
 #' Window of tau (s) outside which C_ade(x, tau) is below exp(-drop) of its
 #' maximum, i.e. contributes nothing to the solution
-ade_support <- function(x, v, D, drop = 40) {
+ade_support <- function(x, v, D, drop = 30) {
   t_adv <- x / v
   grid  <- exp(seq(log(t_adv * 1e-4), log(t_adv * 1e3), length.out = 4000))
   lc    <- log_c_ade(x, grid, v, D, A = 1, mass = 1)
@@ -147,16 +147,17 @@ ade_support <- function(x, v, D, drop = 40) {
 #'                 (default = L, i.e. the outlet)
 #' @param storage_conc if TRUE, also compute Cs (costs ~2x). Default FALSE:
 #'                 no caller in the pipeline uses Cs, so it is returned as NA.
-#' @param nodes_per_sigma node density of the tau integral, per standard
-#'                 deviation of the ADE pulse. 25 gives relative errors
-#'                 around 1e-4 or better; see tsm_selftest().
+#' @param nodes_per_sigma node density of the tau integral, per smallest
+#'                 time scale of the integrand (ADE pulse width or storage-
+#'                 time spread). 10 gives relative errors < 5e-4 of the
+#'                 peak (tested); raise it for reference runs.
 #'
 #' @return data.frame(time, C, Cs) at the sampling station, one row per
 #'   element of `times`, in the same order
 simulate_tsm <- function(L, Q, A = NULL, v = NULL, D, alpha, As,
                          lambda = 0, lambda_s = 0, mass, times,
                          n_cells = 40, sample_x = L,
-                         storage_conc = FALSE, nodes_per_sigma = 25) {
+                         storage_conc = FALSE, nodes_per_sigma = 10) {
   
   if (is.null(A) && is.null(v)) stop("supply either A or v")
   if (is.null(A)) A <- Q / v
@@ -194,45 +195,61 @@ simulate_tsm <- function(L, Q, A = NULL, v = NULL, D, alpha, As,
   ag    <- alpha * gam
   
   sup <- ade_support(x, v, D)
-  hi  <- min(sup$hi, max(times[pos]))
-  if (hi <= sup$lo) {              # every output time precedes the pulse
+  if (max(times[pos]) <= sup$lo) {   # every output time precedes the pulse
     return(data.frame(time = times, C = C, Cs = Cs))
   }
-  n_tau <- ceiling((hi - sup$lo) / sup$sigma * nodes_per_sigma)
-  n_tau <- max(200L, min(as.integer(n_tau), 20000L))
-  tau <- seq(sup$lo, hi, length.out = n_tau)
-  h   <- tau[2] - tau[1]
-  base <- log_c_ade(x, tau, v, D, A, mass) - (alpha + lambda) * tau
   
+  # Node spacing must resolve BOTH scales in the integrand:
+  #   * the ADE pulse, width sigma = sqrt(2 D x / v^3);
+  #   * the storage kernel, whose finest scale is one exchange trip,
+  #     1 / (gamma + lambda_s). With a small storage zone (As/A -> 0) gamma
+  #     is large and this is seconds, far below sigma.
+  # (2026-09 fix: the first version sized nodes on sigma only; for
+  # RA_20231005_downstream -- As/A = 0.0017, 1/gamma ~ 4 s, node spacing
+  # ~100 s -- the kernel was aliased and the curve oscillated.)
   for (i in pos) {
     t <- times[i]
-    # direct (never-stored) term
     base_t <- log_c_ade(x, t, v, D, A, mass) - (alpha + lambda) * t
-    direct <- exp(base_t)
+    direct <- exp(base_t)            # fraction never stored
     
-    k <- if (t > tau[1]) findInterval(t, tau, left.open = TRUE) else 0L
-    if (k == 0L) {                 # t before the pulse window: integral ~ 0
+    # window of tau that contributes: inside the ADE support AND within the
+    # storage-time range reachable by time t (Poisson number of trips,
+    # each exponential; generous upper quantile)
+    m     <- alpha * t                       # expected number of trips
+    n_hi  <- m + 10 * sqrt(m) + 10
+    n_lo  <- max(0, m - 10 * sqrt(m) - 10)
+    u_max <- (n_hi + 10 * sqrt(n_hi) + 10) / gam_s
+    u_min <- if (n_lo > 0) max(0, (n_lo - 10 * sqrt(n_lo)) / gam_s) else 0
+    # kernel scale: one trip (1/gamma) when few trips, the spread of the
+    # total storage time, sqrt(2m)/gamma, when many (2026-09 speed fix: using
+    # 1/gamma always made fast-exchange cases need ~20,000 nodes per time)
+    w     <- max(1, sqrt(2 * m)) / gam_s
+    h_max <- min(sup$sigma, w) / nodes_per_sigma
+    a <- max(sup$lo, t - u_max)
+    b <- min(sup$hi, t - u_min)
+    if (b <= a) {
       C[i] <- direct
       if (storage_conc) Cs[i] <- 0
       next
     }
-    idx <- seq_len(k)              # nodes with tau < t
-    u   <- t - tau[idx]
-    z   <- 2 * sqrt(ag * tau[idx] * u)
+    n_tau <- max(50L, min(as.integer(ceiling((b - a) / h_max)) + 1L, 20000L))
+    tau <- seq(a, b, length.out = n_tau)
+    h   <- tau[2] - tau[1]
+    u   <- t - tau
+    z   <- 2 * sqrt(ag * tau * u)
     # z <= alpha*tau + gamma*u (AM-GM), so this exponent never overflows
-    e   <- exp(base[idx] - gam_s * u + z)
+    e   <- exp(log_c_ade(x, tau, v, D, A, mass) - (alpha + lambda) * tau - gam_s * u + z)
     
-    g1     <- e * sqrt(ag * tau[idx] / u) * besselI(z, 1, expon.scaled = TRUE)
-    g1_end <- exp(base_t) * ag * t   # limit of the integrand as tau -> t
-    I1_int <- h * (sum(g1) - 0.5 * g1[1] - 0.5 * g1[k]) +
-      0.5 * (t - tau[k]) * (g1[k] + g1_end)
-    C[i] <- direct + I1_int
+    at0 <- u <= 0                     # node at tau = t: use the analytic limit
+    g1 <- numeric(n_tau)
+    g1[!at0] <- e[!at0] * sqrt(ag * tau[!at0] / u[!at0]) *
+      besselI(z[!at0], 1, expon.scaled = TRUE)
+    g1[at0]  <- exp(base_t) * ag * t
+    C[i] <- direct + h * (sum(g1) - 0.5 * (g1[1] + g1[n_tau]))
     
     if (storage_conc) {
-      g0     <- gam * e * besselI(z, 0, expon.scaled = TRUE)
-      g0_end <- exp(base_t) * gam
-      Cs[i]  <- h * (sum(g0) - 0.5 * g0[1] - 0.5 * g0[k]) +
-        0.5 * (t - tau[k]) * (g0[k] + g0_end)
+      g0 <- gam * e * besselI(z, 0, expon.scaled = TRUE)
+      Cs[i] <- h * (sum(g0) - 0.5 * (g0[1] + g0[n_tau]))
     }
   }
   
@@ -293,6 +310,17 @@ tsm_selftest <- function(L = 162, Q = 0.3833, v = 0.0817, mass = 7632,
                        lambda_s = lam_s, mass = mass, times = tt)$C
     out[[length(out) + 1]] <- data.frame(D = D, check = "uptake: int(C) / exact Laplace M0",
                                          value = trap(tt, cu) / m0_exact, target = 1)
+  }
+  # 5. fast exchange (tiny storage zone, 1/gamma of seconds): the curve
+  #    must be smooth and converged -- refining the nodes 4x changes nothing
+  L2 <- 135; Q2 <- 0.210; v2 <- 0.0199; A2 <- Q2 / v2
+  tt <- seq(0, 10200, by = 10)
+  for (asr in c(0.0017, 0.02, 0.5)) {
+    c1 <- simulate_tsm(L2, Q2, A2, D = 0.2, alpha = 4e-4, As = asr * A2, mass = 5947, times = tt)$C
+    c4 <- simulate_tsm(L2, Q2, A2, D = 0.2, alpha = 4e-4, As = asr * A2, mass = 5947, times = tt,
+                       nodes_per_sigma = 100)$C
+    out[[length(out) + 1]] <- data.frame(D = 0.2, check = sprintf("converged, As/A = %g (4x nodes)", asr),
+                                         value = max(abs(c1 - c4)) / max(c4), target = 0)
   }
   res <- do.call(rbind, out)
   res$ok <- abs(res$value - res$target) < tol
