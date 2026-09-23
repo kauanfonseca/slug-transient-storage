@@ -692,4 +692,3 @@ cat("\nReading guide:\n",
     " V8 : exact ADE, no storage, no grid. If V8 beats V0, the pipeline's TSM is being\n",
     "      held back by its setup, not by its physics.\n",
     "Outputs written to: ", OUT_DIR, "\n")
-
