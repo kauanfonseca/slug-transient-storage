@@ -26,12 +26,12 @@ suppressPackageStartupMessages(library(ggplot2))
 #' @param title plot title
 #' @param unit y-axis unit label
 plot_btc_fit <- function(obs_time, obs_conc, L, Q, A, D, alpha, As,
-                          lambda = 0, lambda_s = 0, mass, title = "", unit = "mg/L",
-                          n_cells = 40, obs_kind = NULL) {
+                         lambda = 0, lambda_s = 0, mass, title = "", unit = "mg/L",
+                         n_cells = 40, obs_kind = NULL) {
   sim_times <- seq(0, max(obs_time), length.out = 400)
   sim <- simulate_tsm(L = L, Q = Q, A = A, D = D, alpha = alpha, As = As,
-                       lambda = lambda, lambda_s = lambda_s, mass = mass,
-                       times = sim_times, n_cells = n_cells)
+                      lambda = lambda, lambda_s = lambda_s, mass = mass,
+                      times = sim_times, n_cells = n_cells)
   if (is.null(obs_kind)) obs_kind <- rep("observed", length(obs_time))
   obs_df <- data.frame(time = obs_time, conc = obs_conc, kind = obs_kind)
   ggplot() +
@@ -60,10 +60,10 @@ plot_all_hydraulic_fits <- function(hyd_fits, events, btc_conservative, master_t
   for (eid in names(hyd_fits)) {
     hf <- hyd_fits[[eid]]
     e <- events[events$event_id == eid, ]
-
+    
     if (identical(hf$conservative_source, "probe_grab")) {
       sub <- master_tsm[master_tsm$event_id == eid & !is.na(master_tsm$nacl_mgL_grab) &
-                           master_tsm$time_since_release_s >= 0, c("time_since_release_s", "nacl_mgL_grab")]
+                          master_tsm$time_since_release_s >= 0, c("time_since_release_s", "nacl_mgL_grab")]
       sub <- unique(sub)
       names(sub)[names(sub) == "nacl_mgL_grab"] <- "nacl_mgL"
     } else {
@@ -77,7 +77,10 @@ plot_all_hydraulic_fits <- function(hyd_fits, events, btc_conservative, master_t
     borrowed <- if (!is.null(hf$hydraulics_borrowed_from)) {
       paste0(" [hydraulics borrowed from ", hf$hydraulics_borrowed_from, "]")
     } else ""
-    src_tag <- if (identical(hf$conservative_source, "probe_grab")) " [probe grabs]" else ""
+    src_tag <- switch(hf$conservative_source %||% "",
+                      probe_grab = " [probe grabs]",
+                      logger_rescaled = sprintf(" [logger shape, mass x %.2f]", hf$logger_recovery),
+                      "")
     # re-derive the same pre-arrival gap fill used at fit time (probe grabs
     # only -- see fit_all_hydraulics()) purely for plotting, so the fill is
     # always visible (hollow red points) rather than hidden inside the fit
@@ -87,11 +90,13 @@ plot_all_hydraulic_fits <- function(hyd_fits, events, btc_conservative, master_t
       list(time = sub$time_since_release_s, value = pmax(sub$nacl_mgL, 0),
            kind = rep("observed", nrow(sub)))
     }
+    # the mass the fit actually used (rescaled for "logger_rescaled" events)
+    mass_plot <- if (!is.null(hf$nacl_mass_fit_g)) hf$nacl_mass_fit_g else e$nacl_mass_g
     p <- plot_btc_fit(gf$time, gf$value,
-                       hf$L, hf$Q, hf$A, hf$D, hf$alpha, hf$As, mass = e$nacl_mass_g,
-                       n_cells = n_cells, unit = "mg/L", obs_kind = gf$kind,
-                       title = sprintf("%s -- NaCl fit (RMSE=%.3f)%s%s", eid,
-                                        ifelse(is.na(hf$rmse), NA, hf$rmse), src_tag, borrowed))
+                      hf$L, hf$Q, hf$A, hf$D, hf$alpha, hf$As, mass = mass_plot,
+                      n_cells = n_cells, unit = "mg/L", obs_kind = gf$kind,
+                      title = sprintf("%s -- NaCl fit (RMSE=%.3f)%s%s", eid,
+                                      ifelse(is.na(hf$rmse), NA, hf$rmse), src_tag, borrowed))
     print(p)
   }
 }
@@ -110,7 +115,7 @@ plot_all_uptake_fits <- function(summary_tbl, hyd_fits, master_tsm, n_cells = 40
     r <- ok[i, ]
     hf <- hyd_fits[[r$event_id]]
     nut <- master_tsm[master_tsm$event_id == r$event_id & master_tsm$solute == r$solute &
-                         !is.na(master_tsm[[r$conc_col]]), ]
+                        !is.na(master_tsm[[r$conc_col]]), ]
     nut <- nut[order(nut$time_since_release_s), ]
     flag <- if (isTRUE(r$lambda_at_bound) || isTRUE(r$lambda_s_at_bound)) "  [check identifiability]" else ""
     # re-derive the pre-arrival gap fill applied at fit time, purely for
@@ -122,10 +127,10 @@ plot_all_uptake_fits <- function(summary_tbl, hyd_fits, master_tsm, n_cells = 40
            kind = rep("observed", nrow(nut)))
     }
     p <- plot_btc_fit(gf$time, gf$value,
-                       hf$L, hf$Q, hf$A, hf$D, hf$alpha, hf$As,
-                       lambda = r$lambda_1s, lambda_s = r$lambda_s_1s,
-                       mass = r$mass_injected_mg, n_cells = n_cells, unit = "ug/L", obs_kind = gf$kind,
-                       title = sprintf("%s -- %s (%s)%s", r$event_id, r$solute, r$correction, flag))
+                      hf$L, hf$Q, hf$A, hf$D, hf$alpha, hf$As,
+                      lambda = r$lambda_1s, lambda_s = r$lambda_s_1s,
+                      mass = r$mass_injected_mg, n_cells = n_cells, unit = "ug/L", obs_kind = gf$kind,
+                      title = sprintf("%s -- %s (%s)%s", r$event_id, r$solute, r$correction, flag))
     print(p)
   }
 }
@@ -148,3 +153,5 @@ plot_identifiability <- function(lhs, param, natural_units = TRUE, xlab = param)
          title = paste("Identifiability scan:", param)) +
     theme_minimal(base_size = 12)
 }
+
+`%||%` <- function(a, b) if (is.null(a)) b else a
