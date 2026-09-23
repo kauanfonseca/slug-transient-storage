@@ -1,0 +1,16 @@
+column,unit,description
+point_id,-,"Sampling point key: stream code alone, or stream_station (e.g. RA_downstream) when the stream has multiple stations"
+stream,-,Stream code
+station,-,Station (upstream/downstream); NA when the stream has only one station
+discharge_source,-,"logger, probe, or manual -- which conservative-tracer/discharge-estimation method these averaged values come from (see events.csv discharge_source); NONE_VALID means every campaign at this point was excluded (flag_discharge_invalid)"
+n_campaigns,-,Number of valid (non-excluded) campaigns at this point using this discharge_source
+event_ids,-,Semicolon-separated event_id(s) averaged into this row
+mean_discharge_Ls,L/s,Mean adopted discharge across the campaigns in this row
+sd_discharge_Ls,L/s,Sample standard deviation of discharge (NA when n_campaigns = 1)
+min_discharge_Ls,L/s,Minimum discharge across the campaigns in this row
+max_discharge_Ls,L/s,Maximum discharge across the campaigns in this row
+mean_water_velocity_ms,m/s,Mean adopted water velocity across the campaigns in this row (sd/min/max analogous)
+mean_stream_depth_m,m,Mean adopted stream depth across the campaigns in this row (sd/min/max analogous)
+mean_reach_length_m,m,Mean reach length across the campaigns in this row -- normally constant per point; a nonzero sd would flag a reach-length inconsistency worth checking (sd/min/max analogous)
+mean_reach_mean_width_m,m,Mean reach mean width across the campaigns in this row (sd/min/max analogous)
+excluded_events_note,-,"Free text: which event(s) at this point were excluded from this average (flag_discharge_invalid) and why they don't appear in event_ids -- never a silent drop"
