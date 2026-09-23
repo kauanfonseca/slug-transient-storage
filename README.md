@@ -69,6 +69,20 @@ Tables joined on `event_id` (`stream_YYYYMMDD_{slug_label|station|single}`):
   Regenerated from `events.csv`/`btc_conservative.csv`/`master_tsm.csv` by
   `build_review_workbook.py`; edit those source tables, never this file,
   if a correction is needed.
+- **`tsm_consolidated_long.csv`** — a single flat CSV with everything: the
+  continuous NaCl logger series, the hand-probe NaCl grabs, and the nutrient
+  grabs, all stacked as rows (long/tidy format, one row per measurement --
+  ~6,300 logger + ~250 probe + ~430 nutrient rows across all 14 campaigns),
+  with that event's hydraulics/metadata (`reach_length_m`, `discharge_Ls`,
+  `water_velocity_ms`, `discharge_source`, `nacl_mass_g`, etc.) repeated on
+  every row. A `source` column (`logger`/`nacl_probe_grab`/`nutrient_grab`)
+  and `solute` column say what each row is; only the columns relevant to
+  that row's `source` are populated, everything else is `NA` by design (a
+  logger row has no `conc_corr_ugL`, a nutrient row has no `spc_uscm`, etc.)
+  -- this is normal for stacked/long data, not missing data. Regenerated
+  from the same 3 canonical tables by `build_consolidated_long.py`; edit
+  those, never this file. See `dict_tsm_consolidated_long.csv` for the full
+  column list.
 
 Data dictionaries for each table are in `data_derived/dictionary/`
 (`dict_<table_name>.csv`, columns: `column, unit, description`).
