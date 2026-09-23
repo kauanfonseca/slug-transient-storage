@@ -60,6 +60,15 @@ Tables joined on `event_id` (`stream_YYYYMMDD_{slug_label|station|single}`):
 - **`coprec_mass_balance.csv`** — the CaCO₃ co-precipitation correction's
   working table (Ca mass balance underlying `p_coprec_ugL` in
   `master_tsm.csv`).
+- **`export_excel/tsm_review_workbook_all_campaigns.xlsx`** — a read-only,
+  human-friendly companion export, one tab per campaign (`event_id`),
+  combining that campaign's hydraulics/metadata (from `events.csv`), its
+  conservative-tracer (NaCl) series -- whichever of logger or hand-probe was
+  actually used to fit that event's transient-storage hydraulics -- and its
+  nutrient grabs, side by side without needing to join the CSVs in R.
+  Regenerated from `events.csv`/`btc_conservative.csv`/`master_tsm.csv` by
+  `build_review_workbook.py`; edit those source tables, never this file,
+  if a correction is needed.
 
 Data dictionaries for each table are in `data_derived/dictionary/`
 (`dict_<table_name>.csv`, columns: `column, unit, description`).
