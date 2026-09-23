@@ -702,6 +702,42 @@ not the old manual 205/251) — note whatever the new number actually is,
 since §4.8's text above only states the mechanism, not the resulting
 value.
 
+**5.8 RESOLVED (2026-09-23) — the TSM/uptake batch pipeline was not
+reproducible across machines/R installations; fixed via per-job
+seeding.** Comparing `data_derived/tsm_uptake_summary.csv` before and
+after the `ca2d3a2` "handoff updates" commit (its parent `d286ddb`
+changed nothing in `R/` or `master_tsm.csv`) showed that re-running the
+identical `run_tsm_uptake_all(seed = 1)` on a different machine changed
+`uptake_significant`/`lambda_at_bound` for several event x solute rows,
+including `RS_20231011_single` NH4-N going from `pct_total_uptake`
+0.01% to 26.57%. Root cause: `set.seed(seed)` was called once, before
+looping over all events (Stage 1) or all event x solute x correction
+jobs (Stage 2), so every job's Latin Hypercube draw depended on
+however many random draws every job before it had consumed -- and
+`sample()` (used inside `lhs_sample()`, `tsm_calibrate.R`, to break
+correlation across LHS parameters) is only guaranteed to reproduce
+identically for a given seed on the same R version/platform (R's
+default `sample.kind` changed in R 3.6.0). Fixed by giving every job
+its own seed, derived deterministically from a stable string key
+(`job_seed(seed, key)`, new in `tsm_calibrate.R`) instead of from call
+order -- `fit_all_hydraulics()` now seeds each event off its
+`event_id`, `run_one_uptake()`/`run_tsm_uptake_all()` off
+`"event_id|solute|conc_col"`, and `app_tsm_review.R`'s Refit buttons do
+the same (base seed 1), so repeated Refit clicks with identical inputs
+now return bit-identical fits instead of silently re-sampling. This
+does not fix non-identifiability itself -- it was, unsurprisingly,
+exactly the events already flagged `lambda_at_bound`/`lambda_s_at_bound`
+that moved the most, since a flat/near-boundary objective function is
+what makes an optimiser's outcome sensitive to tiny numerical
+differences in the first place. **Any batch number for a
+borderline/non-identifiable event from before this fix (i.e. anything
+in the current `tsm_uptake_summary.csv` as of 2026-09-23 or earlier)
+should be treated as unconfirmed until re-run with the current code**;
+see the equivalent note added to vignette 04's "Notes and known
+limitations". No `renv.lock`/`sessionInfo()` capture exists yet to
+pin down the exact environment difference between the two runs (still
+recommended as a follow-up, not yet done).
+
 ------------------------------------------------------------------------
 
 ## 6. NEXT — storage-zone / inverse transient-storage modelling

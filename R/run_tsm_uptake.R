@@ -76,7 +76,14 @@ HYDRAULICS_BORROWED_FROM <- c(SR_20231011_single = "SR_20231009_downstream")
 fit_all_hydraulics <- function(events, btc_conservative, master_tsm,
                                 n_lhs = 250, n_cells = 40, seed = 1,
                                 fill_pre_arrival = TRUE) {
-  set.seed(seed)
+  # Each event gets its OWN seed, derived from `seed` + its event_id (see
+  # job_seed(), tsm_calibrate.R) rather than one set.seed(seed) call shared
+  # across the whole loop -- so a given event's fit no longer depends on how
+  # many events were fitted before it, what order they ran in, or which
+  # R/platform build ran them. This was found to matter: re-knitting the
+  # unchanged pipeline on a different machine previously reproduced some
+  # events' fits and silently changed others (see handoff.md / vignette 04
+  # "Notes and known limitations" for the specific events affected).
   ids <- events %>%
     filter(!isTRUE(flag_discharge_invalid), !is.na(discharge_Ls),
            has_logger | discharge_source == "probe",
@@ -121,7 +128,8 @@ fit_all_hydraulics <- function(events, btc_conservative, master_tsm,
 
     fit <- tryCatch(
       fit_hydraulics(gf$time, gf$value, L, Q, A,
-                      mass_g, n_lhs = n_lhs, n_cells = n_cells),
+                      mass_g, n_lhs = n_lhs, n_cells = n_cells,
+                      seed = job_seed(seed, eid)),
       error = function(err) NULL
     )
     if (is.null(fit)) return(NULL)
@@ -157,9 +165,15 @@ lookup_injected_mass_mg <- function(events_row, nitrogen_raw, phosphate_raw, sol
 
 #' Run the full Stage-2 + partition + metrics pipeline for one event x solute
 #' x concentration-column combination.
+#'
+#' @param seed base seed for this job's Stage-2 LHS scan. The actual seed
+#'   passed to `fit_uptake()` is derived from this plus the job's own
+#'   identity (`job_seed(seed, "event_id|solute|conc_col")`, tsm_calibrate.R)
+#'   so it does not depend on how many other jobs ran first, or in what
+#'   order -- see the comment on `job_seed()` for why that matters.
 run_one_uptake <- function(event_id, solute, conc_col, hyd, events, master_tsm,
                             nitrogen_raw, phosphate_raw, n_lhs = 250, n_cells = 40,
-                            excluded_times = NULL, fill_pre_arrival = TRUE) {
+                            excluded_times = NULL, fill_pre_arrival = TRUE, seed = 1) {
 
   e <- events %>% filter(event_id == !!event_id)
   nut <- master_tsm %>%
@@ -201,7 +215,8 @@ run_one_uptake <- function(event_id, solute, conc_col, hyd, events, master_tsm,
 
   fitU <- tryCatch(
     fit_uptake(gf$time, gf$value, L, Q, A, hydraulics, mass_mg,
-               n_lhs = n_lhs, n_cells = n_cells),
+               n_lhs = n_lhs, n_cells = n_cells,
+               seed = job_seed(seed, paste(event_id, solute, conc_col, sep = "|"))),
     error = function(err) NULL
   )
   if (is.null(fitU)) {
@@ -333,7 +348,8 @@ run_tsm_uptake_all <- function(data_dir = here::here("data_derived"),
   results <- pmap(jobs, function(event_id, solute, conc_col) {
     message(sprintf("  %s | %s | %s", event_id, solute, conc_col))
     run_one_uptake(event_id, solute, conc_col, hyd_fits[[event_id]], events, master_tsm,
-                    nitrogen_raw, phosphate_raw, n_lhs = n_lhs_uptake, n_cells = n_cells)
+                    nitrogen_raw, phosphate_raw, n_lhs = n_lhs_uptake, n_cells = n_cells,
+                    seed = seed)
   })
 
   out <- bind_rows(results) %>%

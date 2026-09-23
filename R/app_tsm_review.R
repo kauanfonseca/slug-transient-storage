@@ -288,7 +288,8 @@ server <- function(input, output, session) {
     fit <- withProgress(message = "Ajustando hidráulica...", value = 0.3, {
       out <- tryCatch(
         fit_hydraulics(gf$time, gf$value, L, Q, A,
-                        e$nacl_mass_g, n_lhs = input$hyd_n_lhs, n_cells = input$hyd_n_cells),
+                        e$nacl_mass_g, n_lhs = input$hyd_n_lhs, n_cells = input$hyd_n_cells,
+                        seed = job_seed(1, input$event_id)),
         error = function(err) NULL
       )
       incProgress(0.7)
@@ -405,7 +406,8 @@ server <- function(input, output, session) {
     fitU <- withProgress(message = "Ajustando uptake...", value = 0.3, {
       out <- tryCatch(
         fit_uptake(gf$time, gf$value, hyd$L, hyd$Q, hyd$A, hydraulics, mass_mg,
-                   n_lhs = input$up_n_lhs, n_cells = input$up_n_cells),
+                   n_lhs = input$up_n_lhs, n_cells = input$up_n_cells,
+                   seed = job_seed(1, paste(input$event_id, input$solute, input$conc_col, sep = "|"))),
         error = function(err) NULL
       )
       incProgress(0.6)

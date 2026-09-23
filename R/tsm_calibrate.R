@@ -33,6 +33,48 @@
 # almost no attention to the tail.
 ################################################################################
 
+#' Derive a stable, portable per-job integer seed from a base seed and a
+#' string key (e.g. an event_id, or "event_id|solute|conc_col").
+#'
+#' Why this exists: `fit_hydraulics()`/`fit_uptake()` draw their global LHS
+#' scan from R's ordinary RNG stream. The batch driver used to call
+#' `set.seed(seed)` exactly ONCE, before looping over all events (Stage 1)
+#' or all event x solute x correction jobs (Stage 2) -- so every job's LHS
+#' draw depended on wherever the RNG stream happened to be after every job
+#' that ran before it. That is fragile in a way that bit us in practice: two
+#' runs of the identical code on the identical data, on two different
+#' machines (this was first run in the cloud sandbox on Linux; re-knit later
+#' on Kauan's Mac), produced materially different fitted lambda/lambda_s for
+#' several events (e.g. RS_20231011_single NH4-N: pct_total_uptake 0.01% ->
+#' 26.57%, uptake_significant FALSE -> TRUE) even with the same `seed = 1`
+#' argument -- almost certainly because `sample()` (used inside
+#' `lhs_sample()` to break correlation across parameters) is only guaranteed
+#' to reproduce identically for a given seed on the SAME R version/platform
+#' (R's default `sample.kind` changed in R 3.6.0, and even the same version
+#' can differ in exactly how many random draws upstream code consumed).
+#' Giving every job its OWN seed, derived deterministically from a stable
+#' string key rather than from call order, makes each job self-contained:
+#' its result no longer depends on how many other jobs ran before it, what
+#' order they ran in, or (mostly) which R/platform build ran them, only on
+#' its own identity and the shared base `seed`. See `fit_all_hydraulics()`
+#' and `run_tsm_uptake_all()`/`run_one_uptake()` for where this is used.
+#'
+#' Deliberately does not use any of R's own string-hashing (`rlang::hash()`,
+#' environment addresses, etc.) since those are not guaranteed portable
+#' across R versions/platforms either -- `utf8ToInt()` plus plain integer
+#' arithmetic is base R and gives the same result everywhere.
+job_seed <- function(seed, key) {
+  # Deliberately done in double precision (not integer): R integers are
+  # 32-bit, and `acc * 31L` overflows well before the modulo below can rein
+  # it back in. Doubles are exact for integers up to 2^53, and `h` is kept
+  # under 2147483647 after every step, so `h * 31` (~6.7e10) never leaves
+  # that exact range.
+  codes <- utf8ToInt(key)
+  h <- 0
+  for (code in codes) h <- (h * 31 + code) %% 2147483647
+  as.integer((h + seed) %% 2147483647)
+}
+
 #' Simple Latin Hypercube sample
 #'
 #' @param bounds named list of c(min, max), one per parameter (natural units;
@@ -128,13 +170,18 @@ fill_pre_arrival_gap <- function(time, value, dt = NULL, min_gap_factor = 1.5) {
 #' @param n_cells spatial resolution
 #' @param bounds_log10 list(D=c(min,max), alpha=c(min,max), As_ratio=c(min,max))
 #'   in log10 units; As_ratio = As/A
+#' @param seed if not NULL, `set.seed(seed)` right before the LHS draw, so
+#'   this call's result depends only on `seed` (see `job_seed()`), not on
+#'   the RNG state left over from whatever ran before it. NULL (default)
+#'   preserves the old behaviour of using the ambient RNG state as-is.
 #' @return list(par = c(D, alpha, As), rmse, lhs = data.frame of the global
 #'   scan with an added `rmse` column, for an identifiability plot)
 fit_hydraulics <- function(obs_time, obs_conc, L, Q, A, mass,
                             n_lhs = 250, n_cells = 40,
                             bounds_log10 = list(D = c(-4, 1),
                                                  alpha = c(-6, -1),
-                                                 As_ratio = c(-3, 1))) {
+                                                 As_ratio = c(-3, 1)),
+                            seed = NULL) {
 
   thin <- thin_series(obs_time, obs_conc, n_max = 200)
 
@@ -155,6 +202,7 @@ fit_hydraulics <- function(obs_time, obs_conc, L, Q, A, mass,
     sqrt_rmse(sim, thin$value)
   }
 
+  if (!is.null(seed)) set.seed(seed)
   lhs <- lhs_sample(bounds_log10, n_lhs)
   lhs$rmse <- apply(lhs, 1, function(r) cost_fun(as.numeric(r[c("D", "alpha", "As_ratio")])))
 
@@ -175,11 +223,15 @@ fit_hydraulics <- function(obs_time, obs_conc, L, Q, A, mass,
 #' @param mass nutrient mass injected, in units consistent with obs_conc
 #' @param bounds_log10 list(lambda=c(min,max), lambda_s=c(min,max)) in log10
 #'   units (1/s)
+#' @param seed if not NULL, `set.seed(seed)` right before the LHS draw --
+#'   see the `seed` argument of `fit_hydraulics()` and `job_seed()` above
+#'   for why this matters (this is the Stage-2 half of the same fix).
 #' @return list(par = c(lambda, lambda_s), rmse, lhs)
 fit_uptake <- function(obs_time, obs_conc, L, Q, A, hydraulics, mass,
                         n_lhs = 250, n_cells = 40,
                         bounds_log10 = list(lambda = c(-7, -1),
-                                             lambda_s = c(-7, -1))) {
+                                             lambda_s = c(-7, -1)),
+                        seed = NULL) {
 
   D  <- hydraulics[["D"]]
   al <- hydraulics[["alpha"]]
@@ -201,6 +253,7 @@ fit_uptake <- function(obs_time, obs_conc, L, Q, A, hydraulics, mass,
     sqrt_rmse(sim, obs_conc)
   }
 
+  if (!is.null(seed)) set.seed(seed)
   lhs <- lhs_sample(bounds_log10, n_lhs)
   lhs$rmse <- apply(lhs, 1, function(r) cost_fun(as.numeric(r[c("lambda", "lambda_s")])))
 
