@@ -1,0 +1,35 @@
+column,unit,description
+event_id,-,Event key; joins to events.csv/btc_conservative.csv/master_tsm.csv
+stream,-,Stream code
+date,-,Campaign date
+station,-,Station (upstream/downstream), where applicable; NA for single-station events
+slug_label,-,Slug label distinguishing co-located same-day releases (e.g. N vs P at RA 2023-09-06); NA where not applicable
+time_since_release_s,s,Seconds since tracer/nutrient addition
+source,-,"logger (continuous conductivity logger), nacl_probe_grab (hand-held-probe NaCl grab), or nutrient_grab (NH4-N/SRP grab) -- which instrument/sample this row is"
+solute,-,NH4-N or SRP for a nutrient_grab row; NA otherwise
+spc_uscm,uS/cm,"Raw specific conductance (logger rows only)"
+spc_corr_uscm,uS/cm,"Background-corrected specific conductance (logger rows only)"
+nacl_mgL,mg/L,"NaCl concentration from the continuous logger, converted from spc_corr_uscm (logger rows only)"
+nacl_mgL_grab,mg/L,"NaCl concentration from a hand-held-probe grab (nacl_probe_grab rows only)"
+conc_ugL,ug/L,"Raw nutrient concentration (nutrient_grab rows only)"
+background_ugL,ug/L,"Mean ambient (pre-release) concentration for this event/solute (nutrient_grab rows only)"
+conc_corr_ugL,ug/L,"Background-corrected nutrient concentration (nutrient_grab rows only)"
+conc_corr_coprec_ugL,ug/L,"SRP only: conc_corr_ugL with the House (1990) CaCO3 co-precipitation correction added back in, approximating biotic-only assimilation (nutrient_grab rows, SRP only)"
+reach_length_m,m,Reach length -- repeated on every row of this event (from events.csv)
+reach_mean_width_m,m,Reach mean width -- repeated on every row of this event
+discharge_Ls,L/s,Adopted discharge for this event -- repeated on every row of this event
+water_velocity_ms,m/s,Adopted water velocity for this event -- repeated on every row of this event
+stream_depth_m,m,Adopted stream depth for this event -- repeated on every row of this event
+discharge_source,-,"logger/probe/manual -- which conservative-tracer source discharge/velocity were derived from, and which source was used to fit this event's TSM hydraulics (see README.md)"
+discharge_method,-,Discharge estimation method label (events.csv)
+nacl_mass_g,g,NaCl tracer mass injected -- repeated on every row of this event
+amonium_added_g,g,NH4Cl salt mass added -- repeated on every row of this event
+phophate_added_g,g,PO4 salt mass added -- repeated on every row of this event
+ph,-,Water pH -- repeated on every row of this event
+temp_c,degC,Water temperature -- repeated on every row of this event
+has_logger,-,Whether this event has a continuous conductivity logger series (events.csv)
+has_nutrients,-,Whether this event has any nutrient grabs (events.csv)
+flag_discharge_invalid,-,"Passed through from events.csv; TRUE means this event was excluded from the TSM pipeline"
+flag_mixing_incomplete,-,Passed through from events.csv
+flag_no_baseline,-,Passed through from events.csv
+flag_weak_signal,-,Passed through from events.csv
