@@ -1,0 +1,2 @@
+L_m,v_in_ms,t_adv_L_over_v_s,t_peak_obs_s,t_centroid_obs_s,ratio_tadv_to_tpeak,ratio_tadv_to_tcentroid,beta_fit,model_centroid_expected_s,model_centroid_bias_pct,v_centroid_consistent_ms,v_refit_V2_ms,v_refit_V7_ms
+162,0.08165322580645161,1984,2044,2283.6558043893046,0.9706457925636007,0.8687824129129483,0.1561052203794135,2293.7127572327563,0.44038829424826176,0.08201281705477934,0.09292126747720629,0.08986900323521264

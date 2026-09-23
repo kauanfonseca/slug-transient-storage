@@ -1,0 +1,2 @@
+t_onset_s,n_pre_arrival,pre_mean_mgL,pre_slope_mgL_per_h,pre_level_at_onset,pre_level_pct_of_peak,n_negative_raw,n_negative_raw_tail,tail_mean_mgL,last_value_mgL,pct_sqrt_cost_from_pre_arrival,pct_points_pre_arrival
+1444,48,0.4313878168397615,2.0400976467658762,0.8479077530544612,4.445190398189485,0,0,0.2380381809281879,0.17405111644873614,47.32207157371244,31.372549019607842
