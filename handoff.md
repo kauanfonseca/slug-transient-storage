@@ -738,7 +738,70 @@ limitations". No `renv.lock`/`sessionInfo()` capture exists yet to
 pin down the exact environment difference between the two runs (still
 recommended as a follow-up, not yet done).
 
+**5.9 Rafa's exact-solver Stage-1 rewrite (`ded1543`, `0ac9cfb`) --
+spot-verified, one open reproducibility gap.** Rafa replaced Stage-1's
+finite-volume/ODE solver with an exact analytical one (`tsm_model.R`:
+Laplace-domain convolution via `besselI`, adaptive node spacing sized to
+both the ADE pulse and the storage kernel -- the earlier version
+under-resolved fast-exchange storage zones, e.g.
+`RA_20231005_downstream`'s As/A = 0.0017), added pre-arrival baseline
+zeroing (`zero_pre_arrival()`, a stopgap for logger drift like
+`CB_20230907_single`'s 0 -> 0.7 mg/L creep before arrival), and made
+velocity a second Stage-1 candidate: every event is now fit twice
+(`v_fixed` = `events$water_velocity_ms`, and `v_fitted` = v as a 4th
+free parameter, Q always fixed from dilution gauging), with the model
+chosen automatically by AICc (`aicc_min_gain = 2`,
+`fit_all_hydraulics()`/`TSM_METHOD` in `run_tsm_uptake.R`). Rationale:
+peak-time velocity systematically underestimates true channel velocity
+once storage delays the peak. Also fixed a real bug (bound-clamped
+internally but the unclamped optimiser vector was what got reported)
+and added a hard-coded `logger_rescaled` treatment for `RA_20230906_N`/
+`_P` specifically (logger SHAPE + probe-consistent mass, since the
+logger recovered only 35%/61% of the injected salt --
+`diag_ra_logger.R`).
+
+Verified 2026-09-24 (fresh machine, R 4.3.3, same input CSVs):
+`tsm_selftest()` passes cleanly, including the new fast-exchange
+convergence check Rafa added (As/A = 0.0017/0.02/0.5, all < 5e-4
+relative). Re-running `fit_all_hydraulics()` at production settings
+(seed 1, n_lhs 250) for `RC_20231007_single` reproduced the committed
+`v_ms`/`D_m2s`/`alpha_1s`/`As_over_A`/`hydraulic_rmse` to ~1e-5 relative
+difference -- the `job_seed()` reproducibility fix (§5.8) holds up
+under the new solver for a well-identified event.
+
+**Not holding up: `RA_20230906_N`/`_P`.** The same rerun gave
+`v`/`D`/`alpha`/`As_over_A` 20-70% off from the committed
+`tsm_hydraulics_summary.csv`, and for `RA_20230906_P` the AUTOMATIC
+MODEL SELECTION ITSELF FLIPPED -- committed run: `v_fixed` (dAICc =
+-1.3, barely below the keep-v_fixed threshold); this rerun: `v_fitted`,
+decisively (dAICc = +43.2). These are exactly the two events Rafa's own
+`diag_ra_logger.R` already flagged as poorly constrained (probe-grab
+fits disagree with each other: v 0.051 vs 0.038, As/A 0.67 vs 0.37).
+Read together: for a borderline-identifiable event, which machine/
+R-version runs the batch can change which hydraulic MODEL gets used for
+the final result, not just its parameter values -- a step beyond the
+§5.8 caveat (which was about parameter drift within the same model).
+Not re-run for the other 11 events (a time-boxed spot check, not a full
+batch rerun). Recommend before treating `RA_20230906_N`/`_P`'s current
+numbers as final: either pin their hydraulic model/parameters manually
+(the Shiny-review flow already has one open case needing exactly this --
+`CB_20230907_single`'s accepted hydraulics used `conservative_source =
+logger`, but Kauan had described accepting `probe_grab` mid-session;
+not yet confirmed which was intended) or re-run with a wider/more
+robust search (more LHS draws or starts) specifically for these two and
+confirm the AICc gap is no longer near the threshold.
+
+**Also stale:** the committed `data_derived/tsm_hydraulics_summary.csv`
+is missing two columns (`logger_recovery`, `nacl_mass_fit_g`) that the
+current `tsm_hydraulics_table()` (as committed in the same `ded1543`)
+does produce -- the file was not regenerated after the code's last edit
+before that commit. Not touched here (see the reproducibility gap
+above -- regenerating it now would just add a third machine's numbers
+to the mix); worth a clean re-run once the RA question above is
+settled.
+
 ------------------------------------------------------------------------
+
 
 ## 6. NEXT — storage-zone / inverse transient-storage modelling
 
