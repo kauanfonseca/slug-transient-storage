@@ -37,6 +37,17 @@
 #   without OTIS/OTIS-P. Stage 2 and the metrics take A, v from the Stage-1
 #   result (hyd$A, hyd$v), never from events$water_velocity_ms.
 #
+#   Before Stage 2 fitting, each event/solute's nutrient grabs go through:
+#     a. hard-coded exclusions (NUTRIENT_EXCLUDED_TIMES / bad samples,
+#        NUTRIENT_VALUE_THRESHOLD / spike values) -- see their comments;
+#     b. a general clock-offset search (find_nutrient_time_shift(),
+#        TSM_METHOD$nutrient_time_shift) that aligns the grab times against
+#        the SELECTED Stage-1 conservative shape, correcting a nutrient-vs-
+#        logger clock desync found in nearly every event (2026-09-25, see
+#        claude/tsm_uptake_pipeline_status.md). The shift itself is not
+#        hard-coded -- only the search is -- and is reported per event x
+#        solute as nutrient_time_shift_s in the output.
+#
 # Inputs (unchanged outputs of the existing pipeline, see README.md /
 # handoff.md): data_derived/events.csv, data_derived/btc_conservative.csv,
 # data_derived/master_tsm.csv, data/nutrients/nutrient_addition_{nitrogen,
@@ -87,7 +98,9 @@ TSM_METHOD <- list(
   v_factor         = 2,            # v search: v_input/2 .. v_input*2
   n_starts         = 3,            # Nelder-Mead starts (each restarted once)
   aicc_min_gain    = 2,            # v_fitted kept only if AICc drops by > 2
-  bound_tol        = 0.02          # "at bound" = within 2% of log10 range
+  bound_tol        = 0.02,         # "at bound" = within 2% of log10 range
+  nutrient_time_shift = TRUE,      # search + apply a per-event/solute clock-offset correction before Stage 2 (see find_nutrient_time_shift())
+  nutrient_shift_range_s = seq(-900, 900, by = 15)
 )
 
 #' Events whose hydraulics should be borrowed from a different event's
@@ -136,6 +149,113 @@ HYDRAULICS_SHARED_WITH <- c(RA_20230906_N = "RA_20230906_P")
 #' logger shape is used and its area is not. N is no longer fit
 #' independently here -- see HYDRAULICS_BORROWED_FROM above.
 CONSERVATIVE_SERIES <- c(RA_20230906_P = "logger_rescaled")
+
+#' Hard-coded per-event/solute nutrient-grab exclusions, by their raw
+#' `time_since_release_s` (BEFORE the time-shift correction below -- see
+#' find_nutrient_time_shift()). All identified by Kauan, 2026-09-25, from
+#' claude/tsm_uptake_pipeline_status.md's nutrient-fit diagnosis and the
+#' resulting time-shift-corrected plots:
+#'
+#'  - CB_20230907_single SRP: 5 grabs (t=2280/2520/2820/3240/3840) jump to
+#'    212/615/630/39/152 ug/L over ~26 min while the paired NaCl is already
+#'    declining (15.5 -> 0 mg/L) -- a 20x spike-and-crash with no plausible
+#'    transport/reaction explanation; a clock shift cannot produce this
+#'    shape (it only translates the curve, it can't invert its slope), so
+#'    these are treated as bad samples, not a timing artifact.
+#'  - RA_20230906_N NH4-N: first 2 grabs (t=2460, 2700), taken while the
+#'    paired NaCl was still exactly 0 -- i.e. before the co-injected tracer
+#'    had arrived at all, the same pre-arrival-background issue the overall
+#'    diagnosis was built on.
+#'  - RA_20230906_P SRP: first grab (t=720), isolated ~38 min before the
+#'    next one (t=3000) and, like the NH4-N pair above, far pre-arrival
+#'    (paired NaCl = 0).
+#'  - RA_20231005_downstream NH4-N: 2nd and 5th grabs by time order
+#'    (t=3480, t=4260) -- this event's Stage-1 hydraulics are already the
+#'    weakest/least identifiable in the set (see handoff.md), so these are
+#'    a smaller, more surgical trim rather than a broad rule.
+NUTRIENT_EXCLUDED_TIMES <- list(
+  CB_20230907_single      = list(SRP     = c(2280, 2520, 2820, 3240, 3840)),
+  RA_20230906_N           = list(`NH4-N` = c(2460, 2700)),
+  RA_20230906_P           = list(SRP     = c(720)),
+  RA_20231005_downstream  = list(`NH4-N` = c(3480, 4260))
+)
+
+#' Per-event/solute concentration-value thresholds: any grab (post
+#' background-correction, i.e. on the fitted `conc_col`) above the given
+#' value (ug/L) is dropped before Stage 2. Kauan, 2026-09-25: specified as
+#' a value rule rather than specific points for these three -- in each case
+#' the excluded grabs are isolated single-sample spikes sitting on an
+#' otherwise low, flat background (the same spike pattern as
+#' CB_20230907_single SRP above), not part of the main breakthrough curve;
+#' the corresponding NH4-N series at RS/SR, which has a normal, smooth
+#' arrival peak that legitimately exceeds these values, was NOT given a
+#' threshold.
+NUTRIENT_VALUE_THRESHOLD <- list(
+  RA_20231005_downstream = list(SRP = 25),
+  RS_20231011_single     = list(SRP = 50),
+  SR_20231011_single     = list(SRP = 60)
+)
+
+#' Drop NUTRIENT_EXCLUDED_TIMES / NUTRIENT_VALUE_THRESHOLD rows from `nut`
+#' (a master_tsm slice for one event x solute x conc_col), returning the
+#' filtered tibble with attr(., "n_dropped_manual") set.
+apply_nutrient_exclusions <- function(event_id, solute, conc_col, nut) {
+  n_dropped <- 0L
+  bad_t <- NUTRIENT_EXCLUDED_TIMES[[event_id]][[solute]]
+  if (!is.null(bad_t)) {
+    n_dropped <- n_dropped + sum(nut$time_since_release_s %in% bad_t)
+    nut <- nut %>% filter(!time_since_release_s %in% bad_t)
+  }
+  thr <- NUTRIENT_VALUE_THRESHOLD[[event_id]][[solute]]
+  if (!is.null(thr)) {
+    over <- nut[[conc_col]] > thr
+    n_dropped <- n_dropped + sum(over, na.rm = TRUE)
+    nut <- nut %>% filter(!over)
+  }
+  attr(nut, "n_dropped_manual") <- n_dropped
+  nut
+}
+
+#' Per-event/solute clock-offset correction for nutrient grabs (Kauan,
+#' 2026-09-25): the nutrient-grab clock and the logger clock were not
+#' synchronized, so `time_since_release_s` for the hand-taken nutrient
+#' samples can be off by a few minutes. Found by grid search over
+#' `TSM_METHOD$nutrient_shift_range_s`: for each candidate shift, evaluate
+#' the SELECTED Stage-1 hydraulics' pure conservative shape (lambda =
+#' lambda_s = 0, at the event's own `nacl_mass_g` -- reaction only reshapes
+#' the tail a little and barely touches the rising edge, so this is a clean
+#' shape reference for a pure timing offset) at `times = obs_t - shift`,
+#' find the best-fit linear amplitude in closed form (this is a SHAPE
+#' match, not a mass-balance one), and score by SSE against the observed
+#' (already exclusion-filtered) grabs. Across nearly every event this
+#' finds a consistent -180s to -345s shift (58-97% SSE reduction versus no
+#' shift), i.e. the nutrient clock was running fast / under-counting
+#' elapsed time -- see claude/tsm_uptake_pipeline_status.md for the full
+#' validation (including why a single mis-timed cluster, CB_20230907_single
+#' SRP, needed its own point exclusion above instead: a shift only
+#' translates the curve, it can't explain that shape).
+#'
+#' NOTE on sign: this fits model(obs_t - shift) ~ obs_c, so a grab's TRUE
+#' time is (obs_t - shift) -- the correction applied downstream is
+#' `time_shifted <- time_since_release_s - shift_s`, not `+`.
+find_nutrient_time_shift <- function(conc_col, hyd, mass_nacl_mg, nut,
+                                     shift_range = TSM_METHOD$nutrient_shift_range_s) {
+  obs_t <- nut$time_since_release_s
+  obs_c <- pmax(nut[[conc_col]], 0)
+  sse_for_shift <- function(shift) {
+    model_c <- simulate_tsm(L = hyd$L, Q = hyd$Q, A = hyd$A, D = hyd$D, alpha = hyd$alpha,
+                            As = hyd$As, lambda = 0, lambda_s = 0, mass = mass_nacl_mg,
+                            times = obs_t - shift, n_cells = 40)$C
+    if (any(!is.finite(model_c)) || sum(model_c^2) == 0) return(Inf)
+    k <- sum(obs_c * model_c) / sum(model_c^2)   # closed-form best-fit amplitude
+    if (!is.finite(k) || k <= 0) return(Inf)
+    sum((obs_c - k * model_c)^2)
+  }
+  sses <- vapply(shift_range, sse_for_shift, numeric(1))
+  if (all(!is.finite(sses))) return(list(shift = 0, sse_best = NA_real_, sse_zero = NA_real_))
+  best <- shift_range[which.min(sses)]
+  list(shift = best, sse_best = min(sses), sse_zero = sses[which(shift_range == 0)])
+}
 
 # small helpers ---------------------------------------------------------------
 `%||%` <- function(a, b) if (is.null(a)) b else a
@@ -378,20 +498,41 @@ run_one_uptake <- function(event_id, solute, conc_col, hyd, events, master_tsm,
     filter(event_id == !!event_id, solute == !!solute, !is.na(.data[[conc_col]])) %>%
     arrange(time_since_release_s)
   # `excluded_times`: grab timestamps (time_since_release_s) to drop before
-  # fitting -- always an explicit list passed in by the caller.
+  # fitting -- always an explicit list passed in by the caller. Combined
+  # with the hard-coded NUTRIENT_EXCLUDED_TIMES / NUTRIENT_VALUE_THRESHOLD
+  # (see their comments above run_one_uptake in this file).
   if (!is.null(excluded_times) && length(excluded_times) > 0) {
     nut <- nut %>% filter(!time_since_release_s %in% excluded_times)
   }
+  nut <- apply_nutrient_exclusions(event_id, solute, conc_col, nut)
+  n_dropped_manual <- attr(nut, "n_dropped_manual") %||% 0L
+
   base_row <- tibble(event_id = event_id, solute = solute, conc_col = conc_col,
                      hydraulic_model = hyd$hydraulic_model %||% NA_character_)
   if (nrow(nut) < 6) return(base_row %>% mutate(fit_status = "too_few_grabs"))
-  
+
   mass_mg <- lookup_injected_mass_mg(e, nitrogen_raw, phosphate_raw, solute)
   if (!is.finite(mass_mg)) return(base_row %>% mutate(fit_status = "no_addition_record"))
-  
+
   L <- hyd$L; Q <- hyd$Q; A <- hyd$A; v <- hyd$v; width <- hyd$width
   hydraulics <- c(D = hyd$D, alpha = hyd$alpha, As = hyd$As)
-  
+
+  # Clock-offset correction (see find_nutrient_time_shift() above): search
+  # once the manual exclusions are already applied, then shift this
+  # event/solute's grab times before anything downstream sees them. Skipped
+  # (shift forced to 0) when TSM_METHOD$nutrient_time_shift is off, or when
+  # the event has no nacl_mass_g to build a conservative reference curve
+  # from (e.g. a borrowed/shared hydraulics event with a missing addition
+  # record -- rare, falls back to uncorrected timing rather than failing).
+  shift_s <- 0
+  if (isTRUE(TSM_METHOD$nutrient_time_shift) && is.finite(e$nacl_mass_g)) {
+    ts <- find_nutrient_time_shift(conc_col, hyd, e$nacl_mass_g * 1000, nut)
+    shift_s <- ts$shift
+  }
+  nut <- nut %>% mutate(time_since_release_s = time_since_release_s - shift_s) %>%
+    filter(time_since_release_s >= 0) %>% arrange(time_since_release_s)
+  if (nrow(nut) < 6) return(base_row %>% mutate(fit_status = "too_few_grabs"))
+
   obs_conc <- pmax(nut[[conc_col]], 0)
   # Nutrient grabs are always sparse, hand-taken samples, so the pre-arrival
   # gap fill applies here by default -- see fill_pre_arrival_gap().
@@ -446,6 +587,7 @@ run_one_uptake <- function(event_id, solute, conc_col, hyd, events, master_tsm,
     event_id = event_id, solute = solute, conc_col = conc_col,
     fit_status = "ok", n_grabs = nrow(nut), mass_injected_mg = mass_mg,
     background_ugL = Camb,
+    nutrient_time_shift_s = shift_s, n_dropped_manual = n_dropped_manual,
     n_gap_filled_uptake = gf$n_added, gap_fill_dt_uptake_s = gf$dt_used,
     # ---- Stage-1 hydraulics used (selected model) ----
     hydraulic_model = hyd$hydraulic_model %||% NA_character_,
