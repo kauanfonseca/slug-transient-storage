@@ -99,14 +99,22 @@ TSM_METHOD <- list(
 #' (the nutrient-slug day's value) for everything downstream of the
 #' hydraulic fit.
 #'
-#' RA_20230906_N (2026-09-25, Kauan): reviewed the logger_rescaled fit for
-#' both N and P side by side -- P's came out acceptable, N's independent
-#' fit did not. Same reach (135 m) and same day, so N now borrows P's D,
-#' alpha, As/A and velocity correction instead of being fit on its own; N
-#' keeps its own Q/discharge for everything downstream of the hydraulic fit,
-#' same mechanism as SR_20231011_single below.
-HYDRAULICS_BORROWED_FROM <- c(SR_20231011_single = "SR_20231009_downstream",
-                              RA_20230906_N = "RA_20230906_P")
+HYDRAULICS_BORROWED_FROM <- c(SR_20231011_single = "SR_20231009_downstream")
+
+#' Events that share ANOTHER event's Stage-1 hydraulics outright -- same
+#' point, same day, one TSM estimate for both slugs -- as opposed to
+#' HYDRAULICS_BORROWED_FROM above, which corrects for a genuinely different
+#' day's flow via a velocity ratio and keeps the borrowing event's own Q.
+#'
+#' RA_20230906_N (2026-09-25, Kauan): reviewed the logger_rescaled fits for
+#' N and P side by side -- P's came out acceptable, N's independent fit did
+#' not (and applying P's parameters to N's own curve, checked separately,
+#' still didn't rise cleanly). Since N and P are the same reach and the same
+#' day, use P's Stage-1 result -- Q, A, v, D, alpha, As, all of it -- as the
+#' hydraulics for N's Stage-2 uptake fit too, unmodified. N's own
+#' water_velocity_ms/discharge_Ls are NOT used for anything past this point;
+#' N is not independently fit or velocity-corrected, it shares P's number.
+HYDRAULICS_SHARED_WITH <- c(RA_20230906_N = "RA_20230906_P")
 
 #' Hard-coded conservative-series choice for Stage 1 (overrides the default
 #' "logger unless events$discharge_source == 'probe'"). Values:
@@ -178,7 +186,8 @@ fit_all_hydraulics <- function(events, btc_conservative, master_tsm,
            !is.na(water_velocity_ms),
            has_logger | discharge_source == "probe" |
              event_id %in% names(CONSERVATIVE_SERIES),
-           !(event_id %in% names(HYDRAULICS_BORROWED_FROM))) %>%
+           !(event_id %in% names(HYDRAULICS_BORROWED_FROM)),
+           !(event_id %in% names(HYDRAULICS_SHARED_WITH))) %>%
     pull(event_id)
   
   results <- map(ids, function(eid) {
@@ -510,6 +519,32 @@ run_tsm_uptake_all <- function(data_dir = here::here("data_derived"),
         params_at_bound = s$params_at_bound, hydraulics_borrowed_from = src,
         conservative_source = "borrowed", model_version = method$model_version)
       message(sprintf("  %s: no usable conservative series; hydraulics borrowed from %s (%s)",
+                      eid, src, s$hydraulic_model))
+    }
+  }
+  
+  # Share hydraulics outright for events on HYDRAULICS_SHARED_WITH (same
+  # point, same day -- see the constant's comment above). Unlike the
+  # borrowing loop above, nothing is recomputed from the target event's own
+  # Q/velocity: Q, A, v, D, alpha, As are copied unchanged from the source.
+  # v_input is kept from the target's own events.csv row for reporting only
+  # (so the gap between what was measured for N and what was actually used
+  # stays visible in the output) -- it plays no role in the fit.
+  for (eid in names(HYDRAULICS_SHARED_WITH)) {
+    src <- HYDRAULICS_SHARED_WITH[[eid]]
+    if (!(eid %in% names(hyd_fits)) && src %in% names(hyd_fits) && eid %in% events$event_id) {
+      e <- events %>% filter(event_id == eid)
+      s <- hyd_fits[[src]]
+      hyd_fits[[eid]] <- list(
+        event_id = eid, L = s$L, Q = s$Q, A = s$A, v = s$v,
+        v_input = e$water_velocity_ms, width = s$width,
+        D = s$D, alpha = s$alpha, As = s$As,
+        rmse = NA_real_, lhs = NULL,
+        hydraulic_model = s$hydraulic_model,
+        selection_reason = paste("shared with", src, "(same point/day, unmodified)"),
+        params_at_bound = s$params_at_bound, hydraulics_borrowed_from = src,
+        conservative_source = "shared", model_version = method$model_version)
+      message(sprintf("  %s: shares %s's hydraulics outright (same point/day) (%s)",
                       eid, src, s$hydraulic_model))
     }
   }
