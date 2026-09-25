@@ -800,6 +800,71 @@ above -- regenerating it now would just add a third machine's numbers
 to the mix); worth a clean re-run once the RA question above is
 settled.
 
+**5.10 §5.9 follow-up (2026-09-25) — items 2-5 spot-checked, and the
+RA_20230906 pair resolved.**
+
+Reproducibility (item 2): reran Stage 1 for all 13 directly-fit events
+at production settings (seed 1, n_lhs 250) on a fresh machine. 10/13
+reproduce the committed `v_ms`/`D_m2s`/`alpha_1s`/`As_over_A` to well
+under 0.1% relative difference, confirming `job_seed()` holds for
+well-identified events. The 3 exceptions are `RA_20230906_N`,
+`RA_20230906_P` (see below) and `RA_20231005_downstream` (see below) --
+all three already flagged in §5.9 as borderline-identifiable, not new
+findings.
+
+`RA_20231005_downstream` (item 3): confirmed non-identifiable, not just
+borderline. Across reruns, `alpha` and `As_ratio` land at opposite ends
+of their search bounds rather than converging -- the LHS surface has no
+interior optimum for this event. Separately confirmed (Kauan, 2026-09-25)
+that this event's conservative curve has **no real data between
+injection and tracer arrival** -- probe grabs start at
+`time_since_release_s = 3120`; `fill_pre_arrival_gap()` bridges the
+0-3120s gap with 17 synthetic zero-value points (`n_gap_filled = 17` in
+the committed table), since no field samples exist for that window.
+Decided: no real data to add, keep the synthetic fill as-is. Given both
+issues together, this event's hydraulics (and anything downstream of
+them, i.e. its uptake numbers) should be treated as unreliable/exploratory
+rather than reported alongside the other events without a caveat --
+excluding it outright vs. flagging it is still Kauan's call, not made
+here.
+
+`SR_20231011_single` (item 4): the fitted velocity looks inconsistent
+with its own `water_velocity_ms` input, but this is real hydraulics, not
+a bug. It borrows `SR_20231009_downstream`'s D/alpha/As-ratio via
+`HYDRAULICS_BORROWED_FROM` (different day, so the borrow applies a
+velocity-correction ratio and keeps its own Q -- see the
+`HYDRAULICS_SHARED_WITH` note below for how this differs from
+`RA_20230906_N`'s case). The velocity ratio between the two days (2.59)
+equals the ratio of their discharge/cross-section ratios exactly
+(`Q_ratio / A_ratio = 2.59`), i.e. the channel was genuinely narrower/
+faster on 2023-10-11 than on 2023-10-09. Already flagged in `events.csv`
+(`flag_sparse_recession`, `flag_discharge_alt`); no code change needed.
+
+Identifiability (item 5), rough first pass: for probe-grab events, among
+`v_fitted` LHS draws within 2x the best RMSE, `cor(log10(v), log10(As_ratio))`
+runs 0.30-0.59 -- a moderate v/As_ratio trade-off, consistent with the
+RA/SR instability above. Caveat: small samples, one RMSE threshold, one
+seed; treat as a first-pass signal, not a final identifiability analysis.
+
+**`RA_20230906_N` now shares `RA_20230906_P`'s hydraulics outright
+(`b18bfa1`, supersedes `9cb9722`).** P's `logger_rescaled` Stage-1 fit
+came out acceptable; N's independent fit did not, and applying P's
+parameters with a velocity-correction ratio against N's own Q (the
+`9cb9722` attempt, same mechanism as `SR_20231011_single` above) still
+didn't rise cleanly on N's own curve. Kauan's call: since N and P are
+the same reach and the same day, don't fit or correct N at all -- reuse
+P's whole Stage-1 result (Q, A, v, D, alpha, As, all of it, unmodified)
+as *the* hydraulics estimate for that point/day, for N's Stage-2 uptake
+fit. This is a new mechanism, `HYDRAULICS_SHARED_WITH`, distinct from
+`HYDRAULICS_BORROWED_FROM`: the latter is for two genuinely different
+days and corrects via a velocity ratio while keeping the borrowing
+event's own Q; the former is a literal copy for the same day/point, with
+N's own `water_velocity_ms` kept only for reporting (visible in the
+output, unused in any computation). Verified in a standalone R session:
+N's copied `Q`/`A`/`v`/`D`/`alpha`/`As` are bit-identical to P's, N is
+excluded from `fit_all_hydraulics()`'s direct-fit eligibility list, and
+`tsm_hydraulics_table()` runs cleanly over the result.
+
 ------------------------------------------------------------------------
 
 
