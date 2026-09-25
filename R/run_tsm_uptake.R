@@ -100,7 +100,11 @@ TSM_METHOD <- list(
   aicc_min_gain    = 2,            # v_fitted kept only if AICc drops by > 2
   bound_tol        = 0.02,         # "at bound" = within 2% of log10 range
   nutrient_time_shift = TRUE,      # search + apply a per-event/solute clock-offset correction before Stage 2 (see find_nutrient_time_shift())
-  nutrient_shift_range_s = seq(-900, 900, by = 15)
+  nutrient_shift_range_s = seq(-900, 900, by = 15),
+  storage_profile      = TRUE,     # profile lambda_s -> ranges for the channel/storage split (see profile_storage_uptake())
+  storage_profile_tol  = 1.05,     # keep (lambda, lambda_s) pairs with sqrt-RMSE <= tol x best
+  storage_profile_grid = seq(-7, -1, by = 0.25),  # log10(lambda_s) grid, same bounds as fit_uptake()
+  storage_detect_pct   = 1         # storage uptake "detected" when the profile's lower bound of pct_storagezone exceeds this
 )
 
 #' Events whose hydraulics should be borrowed from a different event's
@@ -255,6 +259,61 @@ find_nutrient_time_shift <- function(conc_col, hyd, mass_nacl_mg, nut,
   if (all(!is.finite(sses))) return(list(shift = 0, sse_best = NA_real_, sse_zero = NA_real_))
   best <- shift_range[which.min(sses)]
   list(shift = best, sse_best = min(sses), sse_zero = sses[which(shift_range == 0)])
+}
+
+#' Profile of the Stage-2 cost over lambda_s -> RANGES for the channel vs
+#' storage-zone split (2026-09-25, Kauan: the chapter needs zone-separated
+#' uptake to compare with fish excretion).
+#'
+#' Why: As and alpha are well identified from the logger NaCl curve (Stage 1),
+#' but lambda_s (reaction INSIDE the storage zone) can only come from the
+#' sparse nutrient grabs. In most events the cost surface is flat from
+#' lambda_s = 1e-7 up to ~1e-4 and rises after that, so the point estimate
+#' lands on the lower bound: storage uptake is small, but "how small" is not
+#' resolved. A synthetic test on the real hydraulics and grab times
+#' (diag_storage_synthetic.R) recovered a true storage share of 45% to within
+#' ~5-7 points, but a true share of 15-20% came back as 0-27%: with the
+#' current grab design, storage shares below ~20-30% of total uptake are
+#' indistinguishable from zero. So the split is reported as a min-max range
+#' over every (lambda, lambda_s) pair that fits within `tol` of the best
+#' sqrt-RMSE, alongside the point estimate.
+#'
+#' For each lambda_s on the grid, lambda is re-optimised (1-D), and for every
+#' pair kept (plus the fitted pair itself) the Runkel (2007) partition and
+#' the uptake metrics are recomputed.
+profile_storage_uptake <- function(gf, L, Q, A, D, alpha, As, mass, fit_par, fit_rmse,
+                                   depth_main, depth_storage, v, Camb, n_cells = 40,
+                                   method = TSM_METHOD) {
+  prof <- lapply(method$storage_profile_grid, function(lls) {
+    f <- function(ll) {
+      sim <- simulate_tsm(L = L, Q = Q, A = A, D = D, alpha = alpha, As = As,
+                          lambda = 10^ll, lambda_s = 10^lls, mass = mass,
+                          times = gf$time, n_cells = n_cells)$C
+      sqrt_rmse(sim, gf$value)
+    }
+    o <- optimize(f, c(-7, -1))
+    c(lambda = 10^o$minimum, lambda_s = 10^lls, rmse = o$objective)
+  })
+  prof <- as.data.frame(do.call(rbind, prof))
+  prof <- rbind(prof, data.frame(lambda = fit_par[["lambda"]], lambda_s = fit_par[["lambda_s"]],
+                                 rmse = fit_rmse))
+  keep <- prof[prof$rmse <= method$storage_profile_tol * min(prof$rmse), ]
+
+  res <- lapply(seq_len(nrow(keep)), function(k) {
+    p <- tryCatch(partition_uptake(L, Q, A, D, alpha, As, keep$lambda[k], keep$lambda_s[k],
+                                   mass, n_cells = n_cells), error = function(e) NULL)
+    if (is.null(p)) return(NULL)
+    m <- uptake_metrics(v, depth_main, depth_storage, keep$lambda[k], keep$lambda_s[k],
+                        alpha, A, As, Camb)
+    c(pct_total = p$pct_total_uptake, pct_main = p$pct_mainchannel, pct_storage = p$pct_storagezone,
+      U_main = m$U_mainchannel * 3600, U_storage = m$U_storagezone * 3600, U_total = m$U_total * 3600)
+  })
+  res <- as.data.frame(do.call(rbind, res[!vapply(res, is.null, logical(1))]))
+  rng <- function(x) c(min(x, na.rm = TRUE), max(x, na.rm = TRUE))
+  list(n_pairs = nrow(res), lambda_s_max = max(keep$lambda_s),
+       pct_total = rng(res$pct_total), pct_main = rng(res$pct_main),
+       pct_storage = rng(res$pct_storage), U_main = rng(res$U_main),
+       U_storage = rng(res$U_storage), U_total = rng(res$U_total))
 }
 
 # small helpers ---------------------------------------------------------------
@@ -582,7 +641,28 @@ run_one_uptake <- function(event_id, solute, conc_col, hyd, events, master_tsm,
   lambda_at_bound   <- near_bound(fitU$par[["lambda"]], lam_bounds)
   lambda_s_at_bound <- near_bound(fitU$par[["lambda_s"]], lams_bounds)
   uptake_significant <- isTRUE(is.finite(part$pct_total_uptake) && part$pct_total_uptake > 2)
-  
+
+  # ranges for the channel/storage split (see profile_storage_uptake());
+  # withheld (NA) when total uptake isn't significant, same as the point split
+  na2 <- c(NA_real_, NA_real_)
+  pr <- list(n_pairs = NA_integer_, lambda_s_max = NA_real_, pct_total = na2, pct_main = na2,
+             pct_storage = na2, U_main = na2, U_storage = na2, U_total = na2)
+  if (isTRUE(TSM_METHOD$storage_profile) && uptake_significant) {
+    pr <- tryCatch(
+      profile_storage_uptake(gf, L, Q, A, hyd$D, hyd$alpha, hyd$As, mass_mg, fitU$par, fitU$rmse,
+                             depth_main, depth_storage, v, Camb, n_cells = n_cells),
+      error = function(err) pr)
+    # with Stage-1 alpha/As at a bound (RA_20231005_downstream: alpha ~ 0,
+    # As/A = 10) the storage zone barely exchanges, any lambda_s fits, and
+    # the storage flux range is meaningless (U_storagezone ran to 1e4
+    # mg/m2/h) -- keep the total, withhold the split
+    pab <- hyd$params_at_bound %||% ""
+    if (!is.na(pab) && nzchar(pab)) {
+      pr$pct_main <- na2; pr$pct_storage <- na2; pr$U_main <- na2; pr$U_storage <- na2
+    }
+  }
+  storage_detected <- isTRUE(pr$pct_storage[1] > TSM_METHOD$storage_detect_pct)
+
   tibble(
     event_id = event_id, solute = solute, conc_col = conc_col,
     fit_status = "ok", n_grabs = nrow(nut), mass_injected_mg = mass_mg,
@@ -613,7 +693,18 @@ run_one_uptake <- function(event_id, solute, conc_col, hyd, events, master_tsm,
     vf_total_mps = met$vf_total_mps,
     U_total_mgm2h = met$U_total * 3600,
     lambda_at_bound = lambda_at_bound, lambda_s_at_bound = lambda_s_at_bound,
-    uptake_significant = uptake_significant
+    uptake_significant = uptake_significant,
+    # ---- profile ranges for the channel/storage split ----
+    # every (lambda, lambda_s) pair within storage_profile_tol of the best
+    # sqrt-RMSE; use these (not the point split) when the zone split matters
+    n_profile_pairs = pr$n_pairs, lambda_s_max_profile_1s = pr$lambda_s_max,
+    pct_total_uptake_min = pr$pct_total[1], pct_total_uptake_max = pr$pct_total[2],
+    pct_mainchannel_min = pr$pct_main[1], pct_mainchannel_max = pr$pct_main[2],
+    pct_storagezone_min = pr$pct_storage[1], pct_storagezone_max = pr$pct_storage[2],
+    U_mainchannel_mgm2h_min = pr$U_main[1], U_mainchannel_mgm2h_max = pr$U_main[2],
+    U_storagezone_mgm2h_min = pr$U_storage[1], U_storagezone_mgm2h_max = pr$U_storage[2],
+    U_total_mgm2h_min = pr$U_total[1], U_total_mgm2h_max = pr$U_total[2],
+    storage_uptake_detected = storage_detected
   )
 }
 
