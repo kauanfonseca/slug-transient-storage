@@ -98,7 +98,15 @@ TSM_METHOD <- list(
 #' curve (same 72 m reach), but keep SR_20231011_single's OWN discharge
 #' (the nutrient-slug day's value) for everything downstream of the
 #' hydraulic fit.
-HYDRAULICS_BORROWED_FROM <- c(SR_20231011_single = "SR_20231009_downstream")
+#'
+#' RA_20230906_N (2026-09-25, Kauan): reviewed the logger_rescaled fit for
+#' both N and P side by side -- P's came out acceptable, N's independent
+#' fit did not. Same reach (135 m) and same day, so N now borrows P's D,
+#' alpha, As/A and velocity correction instead of being fit on its own; N
+#' keeps its own Q/discharge for everything downstream of the hydraulic fit,
+#' same mechanism as SR_20231011_single below.
+HYDRAULICS_BORROWED_FROM <- c(SR_20231011_single = "SR_20231009_downstream",
+                              RA_20230906_N = "RA_20230906_P")
 
 #' Hard-coded conservative-series choice for Stage 1 (overrides the default
 #' "logger unless events$discharge_source == 'probe'"). Values:
@@ -117,9 +125,9 @@ HYDRAULICS_BORROWED_FROM <- c(SR_20231011_single = "SR_20231009_downstream")
 #' storage zone 1.6-7x the channel (As/A = 7.2, 1.6). The probe-grab fits
 #' disagree with each other (v 0.051 vs 0.038, As/A 0.67 vs 0.37). The
 #' rescaled logger fits agree (v 0.041 vs 0.036, As/A 0.31 vs 0.26), so the
-#' logger shape is used and its area is not.
-CONSERVATIVE_SERIES <- c(RA_20230906_N = "logger_rescaled",
-                         RA_20230906_P = "logger_rescaled")
+#' logger shape is used and its area is not. N is no longer fit
+#' independently here -- see HYDRAULICS_BORROWED_FROM above.
+CONSERVATIVE_SERIES <- c(RA_20230906_P = "logger_rescaled")
 
 # small helpers ---------------------------------------------------------------
 `%||%` <- function(a, b) if (is.null(a)) b else a
