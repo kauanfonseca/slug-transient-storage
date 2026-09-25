@@ -41,6 +41,20 @@ summary_tbl %>%
   knitr::kable(digits = 2)
 ```
 
+### Channel vs storage-zone split: ranges
+
+`lambda_s` is poorly constrained by the sparse nutrient grabs, so the point split above sits on the lambda_s lower bound in most events. The ranges below come from a profile over lambda_s (every lambda, lambda_s pair within 5% of the best fit; see `profile_storage_uptake()` in `R/run_tsm_uptake.R`). Use these, not the point split, for anything that depends on the zone split. `U_*` are areal fluxes per m2 of streambed (mg m-2 h-1), directly comparable between zones. With the current grab design, storage shares below roughly 20-30% of total uptake cannot be distinguished from zero (synthetic test, `diag_storage_synthetic.R`), so `storage_uptake_detected = FALSE` means "below detection", with the upper bound in `pct_storagezone_max`.
+
+```{r split-ranges}
+summary_tbl %>%
+  filter(fit_status == "ok") %>%
+  select(event_id, solute, correction, pct_total_uptake_min, pct_total_uptake_max,
+         pct_storagezone_min, pct_storagezone_max,
+         U_mainchannel_mgm2h_min, U_mainchannel_mgm2h_max,
+         U_storagezone_mgm2h_min, U_storagezone_mgm2h_max, storage_uptake_detected) %>%
+  knitr::kable(digits = 3)
+```
+
 ### Reading the output table
 
 -   `fit_status`: `"ok"`, or a reason the event/solute was skipped (`too_few_grabs`, `no_addition_record`, `uptake_fit_failed`).
