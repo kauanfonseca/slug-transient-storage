@@ -106,6 +106,16 @@ plot_all_hydraulic_fits <- function(hyd_fits, events, btc_conservative, master_t
 #' straight from the fitted lambda/lambda_s and hydraulics already stored in
 #' `summary_tbl`/`hyd_fits` (no re-fitting, so this is fast).
 #'
+#' Reapplies the SAME per-event/solute manual exclusions
+#' (NUTRIENT_EXCLUDED_TIMES / NUTRIENT_VALUE_THRESHOLD, run_tsm_uptake.R)
+#' and clock-offset shift (already found and stored as
+#' `nutrient_time_shift_s` by run_one_uptake() -- not re-searched here) that
+#' the fit itself used, so the plotted points always match what the
+#' lambda/lambda_s/RMSE in `summary_tbl` were actually fit to. Before this,
+#' the plot re-pulled the untouched raw grabs from master_tsm, so a
+#' correctly-fit curve could still be shown against the old, uncorrected
+#' points (2026-09-25).
+#'
 #' @param summary_tbl the tibble returned by run_tsm_uptake_all()
 #' @param hyd_fits attr(summary_tbl, "hydraulic_fits")
 #' @param master_tsm the master_tsm table (for the observed grab series)
@@ -117,7 +127,18 @@ plot_all_uptake_fits <- function(summary_tbl, hyd_fits, master_tsm, n_cells = 40
     nut <- master_tsm[master_tsm$event_id == r$event_id & master_tsm$solute == r$solute &
                         !is.na(master_tsm[[r$conc_col]]), ]
     nut <- nut[order(nut$time_since_release_s), ]
+    # same hard-coded exclusions run_one_uptake() applied before fitting
+    if (exists("apply_nutrient_exclusions")) {
+      nut <- apply_nutrient_exclusions(r$event_id, r$solute, r$conc_col, nut)
+    }
+    # same clock-offset correction, using the shift ALREADY found and
+    # stored by run_one_uptake() (nutrient_time_shift_s) -- not re-searched
+    shift_s <- if (!is.null(r$nutrient_time_shift_s) && is.finite(r$nutrient_time_shift_s)) r$nutrient_time_shift_s else 0
+    nut$time_since_release_s <- nut$time_since_release_s - shift_s
+    nut <- nut[nut$time_since_release_s >= 0, ]
+    nut <- nut[order(nut$time_since_release_s), ]
     flag <- if (isTRUE(r$lambda_at_bound) || isTRUE(r$lambda_s_at_bound)) "  [check identifiability]" else ""
+    shift_tag <- if (shift_s != 0) sprintf(" [t-shift %+ds]", as.integer(shift_s)) else ""
     # re-derive the pre-arrival gap fill applied at fit time, purely for
     # plotting (nutrient grabs are always sparse -- see run_one_uptake())
     gf <- if (isTRUE(r$n_gap_filled_uptake > 0)) {
@@ -130,7 +151,7 @@ plot_all_uptake_fits <- function(summary_tbl, hyd_fits, master_tsm, n_cells = 40
                       hf$L, hf$Q, hf$A, hf$D, hf$alpha, hf$As,
                       lambda = r$lambda_1s, lambda_s = r$lambda_s_1s,
                       mass = r$mass_injected_mg, n_cells = n_cells, unit = "ug/L", obs_kind = gf$kind,
-                      title = sprintf("%s -- %s (%s)%s", r$event_id, r$solute, r$correction, flag))
+                      title = sprintf("%s -- %s (%s)%s%s", r$event_id, r$solute, r$correction, shift_tag, flag))
     print(p)
   }
 }
