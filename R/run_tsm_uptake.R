@@ -154,6 +154,26 @@ HYDRAULICS_SHARED_WITH <- c(RA_20230906_N = "RA_20230906_P")
 #' independently here -- see HYDRAULICS_BORROWED_FROM above.
 CONSERVATIVE_SERIES <- c(RA_20230906_P = "logger_rescaled")
 
+#' Time-to-peak (s) used for the Stage-1 input velocity v_input = L / t_peak,
+#' overriding events$water_velocity_ms. v_input is the fixed v of the
+#' "v_fixed" candidate and the centre of the "v_fitted" search (v_input/2 ..
+#' v_input*2), so a wrong t_peak makes both candidates fail.
+#'
+#' RA_20231005_downstream (2026-09-26, diag_ra1005.R): events$t_peak_s =
+#' 6780 s comes from t_peak_s_probe in 02_integration.Rmd, the last grab the
+#' field sheet labelled curve_limb == "rising". The NaCl grabs peak at 5220 s
+#' (7.52 mg/L); 6420 s is already 6.13 and 6780 s is 4.75, on the falling
+#' limb (there is a 20-min sampling gap 5220-6420 s, so the true peak lies in
+#' 5220-6000 s). Every other event's labelled t_peak is within a few minutes
+#' of its grab maximum. With 6780 s: v_fixed ends with alpha and As/A at
+#' their bounds (RMSE 0.43) and v_fitted runs into v_input*2 (RMSE 0.11,
+#' dAICc 120, rejected for being at the bound). With 5220 s: v_fitted is
+#' selected, nothing at a bound, RMSE 0.064. The pre-arrival gap fill
+#' (zeros 0-2880 s) is kept: the logger, useless for amplitude, still shows
+#' the tracer front arriving at ~50 min, consistent with the first grab
+#' (3120 s, 1.98 mg/L).
+V_INPUT_TPEAK_OVERRIDE <- c(RA_20231005_downstream = 5220)
+
 #' Hard-coded per-event/solute nutrient-grab exclusions, by their raw
 #' `time_since_release_s` (BEFORE the time-shift correction below -- see
 #' find_nutrient_time_shift()). All identified by Kauan, 2026-09-25, from
@@ -402,7 +422,7 @@ fit_all_hydraulics <- function(events, btc_conservative, master_tsm,
     
     L <- e$reach_length_m
     Q <- e$discharge_Ls / 1000
-    v_input <- e$water_velocity_ms
+    v_input <- if (eid %in% names(V_INPUT_TPEAK_OVERRIDE)) L / V_INPUT_TPEAK_OVERRIDE[[eid]] else e$water_velocity_ms
     A_input <- Q / v_input
     mass_g  <- e$nacl_mass_g
     
@@ -583,8 +603,15 @@ run_one_uptake <- function(event_id, solute, conc_col, hyd, events, master_tsm,
   # the event has no nacl_mass_g to build a conservative reference curve
   # from (e.g. a borrowed/shared hydraulics event with a missing addition
   # record -- rare, falls back to uncorrected timing rather than failing).
+  # No shift when Stage 1 was fit on the hand-held probe grabs themselves
+  # (conservative_source "probe_grab", currently RA_20231005_downstream):
+  # those NaCl readings share the nutrient samples' own timestamps, so there
+  # is no second clock to correct -- a nonzero "shift" there only absorbs
+  # differences in curve shape (tested 2026-09-26: +330 s for NH4-N and the
+  # -900 s bound for the near-flat SRP series).
   shift_s <- 0
-  if (isTRUE(TSM_METHOD$nutrient_time_shift) && is.finite(e$nacl_mass_g)) {
+  if (isTRUE(TSM_METHOD$nutrient_time_shift) && is.finite(e$nacl_mass_g) &&
+      !identical(hyd$conservative_source, "probe_grab")) {
     ts <- find_nutrient_time_shift(conc_col, hyd, e$nacl_mass_g * 1000, nut)
     shift_s <- ts$shift
   }

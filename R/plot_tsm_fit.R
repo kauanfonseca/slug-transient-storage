@@ -201,9 +201,14 @@ plot_fits_grid <- function(summary_tbl, hyd_tbl, events, btc_conservative, maste
     tt <- seq(0, max(sub$t), length.out = 300)
     C <- simulate_tsm(L = h$L_m, Q = h$Q_m3s, A = h$A_m2, D = h$D_m2s, alpha = h$alpha_1s, As = h$As_m2,
                       lambda = 0, lambda_s = 0, mass = mass, times = tt, n_cells = n_cells)$C
+    kind_nacl <- rep("kept", nrow(sub))
+    if (identical(src, "probe_grab") && isTRUE(h$n_gap_filled > 0)) {  # same zeros the Stage-1 fit saw
+      gf <- fill_pre_arrival_gap(sub$t, sub$c)
+      sub <- data.frame(t = gf$time, c = gf$value); kind_nacl <- ifelse(gf$kind == "gap_fill", "gap fill", "kept")
+    }
     tag <- switch(src, logger_rescaled = "logger, rescaled", shared = paste("shared:", h$hydraulics_borrowed_from),
                   borrowed = paste("borrowed:", h$hydraulics_borrowed_from), src)
-    obs[[length(obs) + 1]] <- data.frame(event_id = eid, tracer = tracer_lv[1], t = sub$t / 60, c = sub$c, kind = "kept")
+    obs[[length(obs) + 1]] <- data.frame(event_id = eid, tracer = tracer_lv[1], t = sub$t / 60, c = sub$c, kind = kind_nacl)
     mod[[length(mod) + 1]] <- data.frame(event_id = eid, tracer = tracer_lv[1], t = tt / 60, c = C)
     lab[[length(lab) + 1]] <- data.frame(event_id = eid, tracer = tracer_lv[1],
       txt = sprintf("%s | %s\nRMSE %s", h$hydraulic_model, tag,
