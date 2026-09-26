@@ -174,6 +174,21 @@ CONSERVATIVE_SERIES <- c(RA_20230906_P = "logger_rescaled")
 #' (3120 s, 1.98 mg/L).
 V_INPUT_TPEAK_OVERRIDE <- c(RA_20231005_downstream = 5220)
 
+#' Stage-1 candidate forced for an event, overriding the AICc rule.
+#'
+#' RA_20231005_downstream (Kauan, 2026-09-26): with t_peak = 5220 s the AICc
+#' rule picks v_fitted (RMSE 0.064 vs 0.181, dAICc 91), but that fit reaches
+#' its RMSE by making the front a near-step exactly at the boundary between
+#' the synthetic pre-arrival zeros (last at 2880 s) and the first grab
+#' (3120 s, already 26% of peak), with D = 5.3e-4 m2/s: 10x below the
+#' lowest D fitted on any logger curve here (0.005-0.11 m2/s). That shape is
+#' set by where the gap fill ends, not by the data. The v_fixed candidate
+#' (v = L/5220 s, D = 0.10, alpha = 1.0e-4, As/A = 0.10, nothing at a bound)
+#' is smooth, matches the peak and the tail, and misses only the first
+#' three grabs of the rising limb. Stage 2 barely changes: NH4-N 50 vs 54%
+#' total uptake, SRP 97.5 vs 97%.
+HYDRAULIC_MODEL_OVERRIDE <- c(RA_20231005_downstream = "v_fixed")
+
 #' Hard-coded per-event/solute nutrient-grab exclusions, by their raw
 #' `time_since_release_s` (BEFORE the time-shift correction below -- see
 #' find_nutrient_time_shift()). All identified by Kauan, 2026-09-25, from
@@ -485,7 +500,16 @@ fit_all_hydraulics <- function(events, btc_conservative, master_tsm,
     else if (choose_vf) sprintf("dAICc = %.1f > %g", d_aicc, method$aicc_min_gain)
     else if (v_at_bound) "v_fitted: v at search bound"
     else sprintf("dAICc = %.1f <= %g", d_aicc, method$aicc_min_gain)
-    
+    if (eid %in% names(HYDRAULIC_MODEL_OVERRIDE)) {   # documented per-event choice, see the constant
+      forced <- HYDRAULIC_MODEL_OVERRIDE[[eid]]
+      f_forced <- if (forced == "v_fitted") f_vf else f_fix
+      if (!is.null(f_forced)) {
+        reason <- sprintf("override: %s (AICc rule: %s, %s)", forced,
+                          if (choose_vf) "v_fitted" else "v_fixed", reason)
+        choose_vf <- forced == "v_fitted"; sel <- f_forced
+      }
+    }
+
     message(sprintf("  %-24s %-10s -> %-8s (%s) | v %.4f -> %.4f",
                     eid, source_used, if (choose_vf) "v_fitted" else "v_fixed", reason,
                     v_input, sel$par[["v"]]))
