@@ -82,6 +82,14 @@ plot_all_hydraulic_fits(hyd, ev, btc, mtsm, n_cells = 40)
 plot_all_uptake_fits(summary_tbl, hyd, mtsm, n_cells = 40)
 ```
 
+### All fits together, one page per stream
+
+NaCl (Stage 1), NH4-N and SRP (Stage 2) side by side for every event. Nutrient panels show the grabs Stage 2 actually used (after the manual exclusions and the clock shift); excluded grabs are red crosses, or red triangles pinned to the panel top when they are off-scale. Also runs from the saved CSVs alone (see `plot_fits_grid()` in `R/plot_tsm_fit.R`).
+
+```{r fits-grid, fig.width=10, fig.height=7.5}
+for (p in plot_fits_grid(summary_tbl, attr(summary_tbl, "hydraulics_table"), ev, btc, mtsm)) print(p)
+```
+
 ## Case-by-case curation: `R/app_tsm_review.R`
 
 Looking at all 40 fits above usually turns up event-specific problems that a single batch run cannot fix on its own: a sparse rising limb, a salt curve that won't converge, a nutrient outlier that looks like a field/lab error, or (as happened for the RA slugs) a conservative-tracer source that shouldn't be trusted for that particular event. Rather than hand-tuning the batch script per event, use the companion Shiny app for an interactive, event-by-event pass:
