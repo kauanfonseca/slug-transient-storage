@@ -316,23 +316,44 @@ find_nutrient_time_shift <- function(conc_col, hyd, mass_nacl_mg, nut,
 #' For each lambda_s on the grid, lambda is re-optimised (1-D), and for every
 #' pair kept (plus the fitted pair itself) the Runkel (2007) partition and
 #' the uptake metrics are recomputed.
+#'
+#' Interval ends are exact, not grid points (2026-09-26): on each side of the
+#' accepted grid points, uniroot() finds the log10(lambda_s) where the
+#' profile crosses tol x best, and the partition/metrics are evaluated
+#' there. If the lowest grid point (1e-7) is still accepted, the lower end
+#' is lambda_s = 0 itself (storage share exactly 0, "not detected"); if the
+#' highest (1e-1) is still accepted, the upper end stays at the search limit
+#' and `upper_at_limit` is TRUE.
 profile_storage_uptake <- function(gf, L, Q, A, D, alpha, As, mass, fit_par, fit_rmse,
                                    depth_main, depth_storage, v, Camb, n_cells = 40,
                                    method = TSM_METHOD) {
-  prof <- lapply(method$storage_profile_grid, function(lls) {
+  prof_at <- function(lls) {   # lambda_s = 10^lls (lls = -Inf -> 0); lambda re-optimised
+    ls <- if (is.finite(lls)) 10^lls else 0
     f <- function(ll) {
       sim <- simulate_tsm(L = L, Q = Q, A = A, D = D, alpha = alpha, As = As,
-                          lambda = 10^ll, lambda_s = 10^lls, mass = mass,
+                          lambda = 10^ll, lambda_s = ls, mass = mass,
                           times = gf$time, n_cells = n_cells)$C
       sqrt_rmse(sim, gf$value)
     }
     o <- optimize(f, c(-7, -1))
-    c(lambda = 10^o$minimum, lambda_s = 10^lls, rmse = o$objective)
-  })
-  prof <- as.data.frame(do.call(rbind, prof))
-  prof <- rbind(prof, data.frame(lambda = fit_par[["lambda"]], lambda_s = fit_par[["lambda_s"]],
-                                 rmse = fit_rmse))
-  keep <- prof[prof$rmse <= method$storage_profile_tol * min(prof$rmse), ]
+    c(lambda = 10^o$minimum, lambda_s = ls, rmse = o$objective, lls = lls)
+  }
+  grid <- method$storage_profile_grid
+  prof <- as.data.frame(do.call(rbind, lapply(grid, prof_at)))
+  best <- min(c(prof$rmse, fit_rmse))
+  thr  <- method$storage_profile_tol * best
+  ok   <- which(prof$rmse <= thr)
+  if (length(ok) == 0) ok <- which.min(prof$rmse)
+  cross <- function(i_in, i_out) {   # exact crossing between an accepted and a rejected grid point
+    r <- uniroot(function(x) prof_at(x)[["rmse"]] - thr, sort(c(grid[i_in], grid[i_out])), tol = 1e-3)
+    prof_at(r$root)
+  }
+  lo <- if (min(ok) > 1) cross(min(ok), min(ok) - 1) else prof_at(-Inf)
+  upper_at_limit <- max(ok) == length(grid)
+  hi <- if (!upper_at_limit) cross(max(ok), max(ok) + 1) else unlist(prof[max(ok), ])
+  keep <- rbind(as.data.frame(t(lo)), prof[ok, ], as.data.frame(t(hi)),
+                data.frame(lambda = fit_par[["lambda"]], lambda_s = fit_par[["lambda_s"]],
+                           rmse = fit_rmse, lls = log10(fit_par[["lambda_s"]])))
 
   res <- lapply(seq_len(nrow(keep)), function(k) {
     p <- tryCatch(partition_uptake(L, Q, A, D, alpha, As, keep$lambda[k], keep$lambda_s[k],
@@ -345,7 +366,8 @@ profile_storage_uptake <- function(gf, L, Q, A, D, alpha, As, mass, fit_par, fit
   })
   res <- as.data.frame(do.call(rbind, res[!vapply(res, is.null, logical(1))]))
   rng <- function(x) c(min(x, na.rm = TRUE), max(x, na.rm = TRUE))
-  list(n_pairs = nrow(res), lambda_s_max = max(keep$lambda_s),
+  list(n_pairs = nrow(res), lambda_s_min = lo[["lambda_s"]], lambda_s_max = hi[["lambda_s"]],
+       upper_at_limit = upper_at_limit,
        pct_total = rng(res$pct_total), pct_main = rng(res$pct_main),
        pct_storage = rng(res$pct_storage), U_main = rng(res$U_main),
        U_storage = rng(res$U_storage), U_total = rng(res$U_total))
@@ -696,7 +718,8 @@ run_one_uptake <- function(event_id, solute, conc_col, hyd, events, master_tsm,
   # ranges for the channel/storage split (see profile_storage_uptake());
   # withheld (NA) when total uptake isn't significant, same as the point split
   na2 <- c(NA_real_, NA_real_)
-  pr <- list(n_pairs = NA_integer_, lambda_s_max = NA_real_, pct_total = na2, pct_main = na2,
+  pr <- list(n_pairs = NA_integer_, lambda_s_min = NA_real_, lambda_s_max = NA_real_,
+             upper_at_limit = NA, pct_total = na2, pct_main = na2,
              pct_storage = na2, U_main = na2, U_storage = na2, U_total = na2)
   if (isTRUE(TSM_METHOD$storage_profile) && uptake_significant) {
     pr <- tryCatch(
@@ -748,7 +771,8 @@ run_one_uptake <- function(event_id, solute, conc_col, hyd, events, master_tsm,
     # ---- profile ranges for the channel/storage split ----
     # every (lambda, lambda_s) pair within storage_profile_tol of the best
     # sqrt-RMSE; use these (not the point split) when the zone split matters
-    n_profile_pairs = pr$n_pairs, lambda_s_max_profile_1s = pr$lambda_s_max,
+    n_profile_pairs = pr$n_pairs, lambda_s_min_profile_1s = pr$lambda_s_min,
+    lambda_s_max_profile_1s = pr$lambda_s_max, storage_upper_at_limit = pr$upper_at_limit,
     pct_total_uptake_min = pr$pct_total[1], pct_total_uptake_max = pr$pct_total[2],
     pct_mainchannel_min = pr$pct_main[1], pct_mainchannel_max = pr$pct_main[2],
     pct_storagezone_min = pr$pct_storage[1], pct_storagezone_max = pr$pct_storage[2],
