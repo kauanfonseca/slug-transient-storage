@@ -116,7 +116,17 @@ TSM_METHOD <- list(
 #' (the nutrient-slug day's value) for everything downstream of the
 #' hydraulic fit.
 #'
-HYDRAULICS_BORROWED_FROM <- c(SR_20231011_single = "SR_20231009_downstream")
+#' 2026-09-26 (Kauan): SR_20231011_single no longer borrows -- the list is
+#' now empty and the mechanism is kept for future use. The borrowed
+#' parameters (D 0.006, As/A 0.39, from the higher-flow 09 Oct day) predict
+#' a NaCl peak of ~630 mg/L at 14 min on 11 Oct, against the day's own 28
+#' probe grabs peaking at ~150 mg/L at 17 min (RMSE 4.06 on those grabs).
+#' Fitted on the grabs themselves (probe_grab, like any event with
+#' discharge_source == "probe"), the AICc rule selects v_fitted (D 0.043,
+#' alpha 3.2e-3, As/A 0.61, nothing at a bound, RMSE 0.31). The grabs are
+#' dense (20 s) from 590 to 1250 s and then only one at 2600 s, so the tail
+#' is loosely constrained. See diag_sr1011.R.
+HYDRAULICS_BORROWED_FROM <- setNames(character(0), character(0))
 
 #' Events that share ANOTHER event's Stage-1 hydraulics outright -- same
 #' point, same day, one TSM estimate for both slugs -- as opposed to
